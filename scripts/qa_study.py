@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the explicit QA study matrix; --dry-run prints commands without inference."""
 import argparse
+import copy
 from pathlib import Path
 import shlex
 import subprocess
@@ -57,6 +58,37 @@ def build_commands(config, *, config_path, qa_dataset, repeats=None, requests=No
     return commands, configurations, configurations * repetitions
 
 
+def subset(config, *, models=None, engines=None, rungs=None, concurrency=None):
+    """Return a copy of the study restricted to the selected values (for pilots)."""
+    config = copy.deepcopy(config)
+    study = config['study']
+    def pick(name, available, selected):
+        if selected is None:
+            return available
+        unknown = set(selected) - set(available)
+        if unknown:
+            raise ValueError(f'Unknown {name}: {sorted(unknown)}; available: {sorted(available)}')
+        return [value for value in available if value in selected]
+    all_rungs = {r for blocks in ('model_rungs', 'native_vllm_rungs')
+                 for labels in (study.get(blocks) or {}).values() for r in labels}
+    pick('rungs', sorted(all_rungs), rungs)
+    keep_models = pick('models', list(study['model_rungs']), models)
+    study['engines'] = pick('engines', study['engines'], engines)
+    config['concurrency'] = pick('concurrency', config['concurrency'], concurrency)
+    for block in ('model_rungs', 'native_vllm_rungs'):
+        if block in study:
+            study[block] = {m: [r for r in labels if rungs is None or r in rungs]
+                            for m, labels in (study[block] or {}).items() if m in keep_models}
+            study[block] = {m: labels for m, labels in study[block].items() if labels}
+    if not study['model_rungs'] or not study['engines'] or not config['concurrency']:
+        raise ValueError('The selected subset is empty')
+    return config
+
+
+def comma_list(value, cast=str):
+    return [cast(v) for v in value.split(',') if v]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default=str(ROOT / 'configs/study.yaml'))
@@ -66,10 +98,22 @@ def main():
     parser.add_argument('--llama-server', default='llama-server')
     parser.add_argument('--vllm', default='vllm')
     parser.add_argument('--results-dir', default=str(ROOT / 'results'))
+    parser.add_argument('--models', help='comma-separated subset of study models (pilot)')
+    parser.add_argument('--engines', help='comma-separated subset: llama_cpp,vllm (pilot)')
+    parser.add_argument('--rungs', help='comma-separated subset of quantization rungs (pilot)')
+    parser.add_argument('--concurrency', help='comma-separated subset of concurrency levels (pilot)')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     config_path = Path(args.config).resolve()
     config = yaml.safe_load(config_path.read_text())
+    try:
+        config = subset(config,
+            models=comma_list(args.models) if args.models else None,
+            engines=comma_list(args.engines) if args.engines else None,
+            rungs=comma_list(args.rungs) if args.rungs else None,
+            concurrency=comma_list(args.concurrency, int) if args.concurrency else None)
+    except ValueError as exc:
+        parser.error(str(exc))
     dataset = Path(args.qa_dataset or config['study']['qa_dataset'])
     if not dataset.is_absolute():
         dataset = ROOT / dataset

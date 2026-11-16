@@ -8,9 +8,9 @@ throughput, streaming speed and latency as concurrent requests increase.
 
 The [updated experiment plan](docs/study-plan.md) targets **two models × three
 weight representations × two engines × five concurrency levels × 30 trials**:
-60 configurations and 1,800 measured trials. Native vLLM rows (publisher BF16,
-official Qwen FP8) add 15 configurations so optimized vLLM is measured too:
-75 configurations and 2,250 trials in total. It covers current Qwen/DeepSeek
+60 configurations and 1,800 measured trials, with a light per-trial workload
+estimated at about 4 days on one GB10. Native vLLM rows (publisher BF16,
+Unsloth NVFP4) are optional extras. It covers current Qwen/DeepSeek
 candidates, Unsloth versus official quantization, variability and OpenAI speed tiers.
 
 The plan also adopts [Guldner et al.'s GSMM (2024)](https://doi.org/10.1016/j.future.2024.01.033)
@@ -31,6 +31,22 @@ same-GGUF engine comparisons are separate groups; `scripts/qa_study.py` runs bot
 llama.cpp smoke-test defaults.
 
 ## Run on the Spark
+
+**One command.** Copy the repository to the Spark and, inside `tmux`, run:
+
+```bash
+scripts/spark_run.sh smoke   # setup + one quick trial per engine
+scripts/spark_run.sh pilot   # + pilot subset: concurrency 1,4,16, 5 trials (~11 h estimate)
+scripts/spark_run.sh full    # + full study: 60 configurations x 30 trials (~4 days estimate)
+```
+
+It runs `uv sync`, builds a CUDA `llama-server` if needed, checks the GPU,
+downloads the pinned Unsloth GGUFs, runs a smoke test and then the chosen study,
+and writes a report. Set `VLLM=/path/to/vllm` to include vLLM (provisioned
+separately, see [engines](docs/engines.md#vllm)); without it only llama.cpp runs.
+Logs go to `results/runs/`.
+
+### Manual steps
 
 The backend is **llama.cpp**, using GGUF models and a CUDA
 `llama-server` binary. First [build llama-server](docs/engines.md#build-on-the-spark).

@@ -151,3 +151,13 @@ class MeasuredQATests(unittest.TestCase):
         self.assertEqual(wl['evaluation_mode'], 'measured_qa')
         self.assertEqual(wl['max_output_tokens'], 256)
         self.assertEqual(wl['prompts'][0]['answers'], ['Paris'])
+
+
+class TrialCoverageTest(unittest.TestCase):
+    def test_trials_continue_through_the_dataset(self):
+        row = dict(output_tok_s=10, failed=0, energy_valid=True, token_counts_exact=True)
+        with patch.object(bench, 'run_concurrency_level', AsyncMock(return_value=row)) as run:
+            asyncio.run(bench.sweep('', 'm', [1, 4], bench.make_workload(), 'q4',
+                                    requests_per_agent=3, repeats=3))
+        offsets = {(call.args[2], call.kwargs['request_offset']) for call in run.await_args_list}
+        self.assertEqual(offsets, {(1, 0), (1, 3), (1, 6), (4, 0), (4, 12), (4, 24)})

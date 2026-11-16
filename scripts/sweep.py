@@ -68,7 +68,8 @@ def main() -> int:
                     help="precision label or comma-separated labels; all runs every variant")
     ap.add_argument("--llama-server", default="llama-server", help="path to the CUDA llama-server binary")
     ap.add_argument("--vllm", default="vllm", help="path to vLLM executable (separate runtime environment)")
-    ap.add_argument("--model-revision", default="main", help="Hugging Face revision for model downloads")
+    ap.add_argument("--model-revision", default=None,
+                    help="Hugging Face revision for every rung; default: each rung's configured revision, else main")
     ap.add_argument("--concurrency", default="1", help="comma list; default 1; all uses config levels")
     ap.add_argument("--server-parallel", type=int, help="fixed server slots; fail if estimated not to fit")
     ap.add_argument("--qa-dataset", help="QA JSONL used for concurrent measured requests; save and score those answers")
@@ -130,7 +131,10 @@ def main() -> int:
     if not engine_cfg:
         ap.error(f"no {args.engine} variants for {args.model}")
     args.rung = args.rung or engine_cfg["default_rung"]
-    rungs = [dict(r, repo=r.get("repo", engine_cfg.get("repo")), engine=args.engine)
+    rungs = [dict(r, repo=r.get("repo", engine_cfg.get("repo")),
+                  # A rung with its own repo must pin its own revision.
+                  revision=r.get("revision", None if "repo" in r else engine_cfg.get("revision")),
+                  engine=args.engine)
              for r in engine_cfg["rungs"] if args.rung == "all" or r["rung"] in args.rung.split(",")]
     if args.rung != "all" and set(args.rung.split(",")) - {r["rung"] for r in rungs}:
         ap.error("unknown rung in selection")
@@ -285,13 +289,15 @@ def main() -> int:
             for row in read_records(out_path, repair=True))
     for r in rungs:
         print(f"Resolving {r['repo']} {r.get('file', 'native weights')} (cached downloads are reused)", flush=True)
+        requested_revision = args.model_revision or r.get("revision") or "main"
         try:
-            gguf = (serve.download_gguf(r["repo"], r["file"], args.model_revision)
+            gguf = (serve.download_gguf(r["repo"], r["file"], requested_revision)
                     if r.get("file") else None)
             resolved_revision = (gguf["revision"] if gguf else
-                                 serve.resolve_hf_revision(r["repo"], args.model_revision))
+                                 serve.resolve_hf_revision(r["repo"], requested_revision))
             tokenizer_repo = r.get("tokenizer", model_cfg["shape_from"])
-            tokenizer_revision = (serve.resolve_hf_revision(tokenizer_repo)
+            tokenizer_revision = (serve.resolve_hf_revision(
+                                      tokenizer_repo, model_cfg.get("shape_revision", "main"))
                                   if args.engine == "vllm" and gguf else None)
         except Exception as exc:
             print(f"   SKIP: Model resolution failed: {exc}", flush=True)

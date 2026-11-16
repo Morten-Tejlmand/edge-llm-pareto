@@ -137,8 +137,13 @@ async def run_concurrency_level(
     telemetry_interval: float = .1,
     system_baseline: dict | None = None,
     reference_path: str | None = None,
+    request_offset: int = 0,
 ) -> dict:
-    """Run a finite closed-loop request pool, including startup and drain."""
+    """Run a finite closed-loop request pool, including startup and drain.
+
+    `request_offset` shifts request ids so successive trials continue through a
+    prompt/QA dataset instead of repeating its first `concurrency * requests_per_agent` items.
+    """
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=600.0, max_retries=0)
@@ -148,7 +153,7 @@ async def run_concurrency_level(
             await client.close()
             raise RuntimeError(f"Warmup failed: {warmup['error']}")
     total_requests = concurrency * requests_per_agent
-    counter = iter(range(total_requests))
+    counter = iter(range(request_offset, request_offset + total_requests))
     lock = asyncio.Lock()
     results: list[dict] = []
 
@@ -311,7 +316,8 @@ async def sweep(base_url, model, concurrency_levels, wl, label, out_path=None,
         row = await run_concurrency_level(base_url, model, c, w, requests_per_agent,
                                           warmup_requests=warmup_requests, idle_seconds=idle_seconds,
                                           telemetry_interval=telemetry_interval, system_baseline=system_baseline,
-                                          reference_path=reference_path)
+                                          reference_path=reference_path,
+                                          request_offset=trial * c * requests_per_agent)
         row = dict(row)
         measured_quality = row.get('quality') if w.get('evaluation_mode') == 'measured_qa' else None
         row.update(metadata)

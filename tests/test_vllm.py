@@ -32,18 +32,21 @@ class VllmTests(unittest.TestCase):
         row = dict(base_model='test', label='native-bf16', gguf=None)
         self.assertIsNone(attach_results([row], [])[0]['perplexity_evaluation'])
 
-    def run_backend(self, directory, native=True, ready=True):
+    def run_backend(self, directory, native=True, ready=True, revision=None, extra=()):
         cfg = json.loads(json.dumps(__import__('yaml').safe_load(
             (test_llama_cpp.ROOT / 'configs/models.yaml').read_text())))
         model = cfg['models']['qwen3-4b-2507']
         model['engine_rungs']['vllm'] = (dict(repo='Qwen/test', default_rung='native-bf16',
             rungs=[dict(rung='native-bf16', linear_bits=16)]) if native else
             model['engine_rungs']['llama_cpp'])
+        if revision:
+            model['engine_rungs']['vllm']['revision'] = revision
+            model['shape_revision'] = 'shape-sha'
         path = Path(directory) / 'config.yaml'
         path.write_text(json.dumps(cfg))
         with patch.object(serve, 'resolve_hf_revision', return_value='pinned-native') as resolve:
             result = test_llama_cpp.LlamaSweepTests().run_cli(directory, ready=ready,
-                extra=['--engine', 'vllm', '--config', str(path), '--repeats', '2'])
+                extra=['--engine', 'vllm', '--config', str(path), '--repeats', '2', *extra])
         return result, resolve
 
     def test_native_weights_revision_memory_capacity_and_repeats(self):
@@ -73,7 +76,7 @@ class VllmTests(unittest.TestCase):
             (rc, row, start, _, download, _), resolve = self.run_backend(d, native=False)
         self.assertEqual(rc, 0)
         download.assert_called_once()
-        resolve.assert_called_once_with('unsloth/Qwen3-4B-Instruct-2507')
+        resolve.assert_called_once_with('unsloth/Qwen3-4B-Instruct-2507', 'main')
         cmd = start.call_args.args[0]
         self.assertEqual(cmd[2], '/cache/test.gguf')
         self.assertEqual(cmd[cmd.index('--quantization') + 1], 'gguf')
@@ -109,3 +112,25 @@ class VllmTests(unittest.TestCase):
         single = aggregate(rows[:1])[0]
         self.assertIsNone(single['output_tok_s_std'])
         self.assertIsNone(single['output_tok_s_ci_low'])
+
+
+    def test_configured_revision_pins_native_weights(self):
+        with tempfile.TemporaryDirectory() as d:
+            (rc, *_), resolve = self.run_backend(d, revision='config-sha')
+        self.assertEqual(rc, 0)
+        resolve.assert_called_once_with('Qwen/test', 'config-sha')
+
+    def test_cli_revision_overrides_configured_revision(self):
+        with tempfile.TemporaryDirectory() as d:
+            (rc, *_), resolve = self.run_backend(d, revision='config-sha',
+                                                 extra=['--model-revision', 'cli-sha'])
+        self.assertEqual(rc, 0)
+        resolve.assert_called_once_with('Qwen/test', 'cli-sha')
+
+    def test_gguf_uses_configured_repo_and_tokenizer_revisions(self):
+        with tempfile.TemporaryDirectory() as d:
+            (rc, _, _, _, download, _), resolve = self.run_backend(
+                d, native=False, revision='gguf-sha')
+        self.assertEqual(rc, 0)
+        self.assertEqual(download.call_args.args[2], 'gguf-sha')
+        resolve.assert_called_once_with('unsloth/Qwen3-4B-Instruct-2507', 'shape-sha')
