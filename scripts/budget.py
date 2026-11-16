@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Predict which quantization rungs fit on this GPU, and at what concurrency.
 
-Run this before any sweep. vLLM takes minutes to start and then fails with an
+Run this before any sweep. Loading a model can take minutes and fail with an
 opaque OOM; this answers the same question in seconds and tells you the
-max_model_len / max_num_seqs combination each rung can actually support.
+context length / parallel slot combination each rung can actually support.
 
     python scripts/budget.py
     python scripts/budget.py --context 8192 --model qwen3-4b-2507
@@ -30,7 +30,7 @@ def main() -> int:
     ap.add_argument("--model", default=None, help="model key; default = all")
     ap.add_argument("--context", type=int, default=4096,
                     help="per-agent context length used for the concurrency estimate")
-    ap.add_argument("--engine", default="vllm", choices=["vllm", "llama_cpp"])
+    ap.add_argument("--engine", default="llama_cpp", choices=["llama_cpp", "vllm"])
     add_memory_arguments(ap)
     ap.add_argument("--target", choices=["local", "gb10"], default="local",
                     help="gb10 estimates nominal capacity without probing this machine")
@@ -56,6 +56,8 @@ def main() -> int:
     rc = 0
     for key in keys:
         m = cfg["models"][key]
+        if m.get("budget_note"):
+            print(f"Memory estimate: {m['budget_note']}")
         shape = ModelShape.from_hf(m["shape_from"])
         per_tok = shape.kv_bytes_per_token(cfg["defaults"]["kv_dtype_bytes"])
         print(f"== {key}  ({shape.total_params / 1e9:.2f}B params, "

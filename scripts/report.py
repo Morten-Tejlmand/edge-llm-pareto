@@ -9,11 +9,11 @@ Two objectives are in tension and both matter to an agent workload:
 Raising concurrency trades the second for the first. A configuration is on the
 front if nothing else beats it on both at once.
 
-Accuracy is deliberately absent -- see docs/open-questions.md #3. Until it is
-measured, this front ranks speed only, and a low-bit rung can look optimal here
-while being unusable in practice.
+The default report ranks speed only. Energy reports support exact-match or BLEU quality
+constraints and attached perplexity evaluations; combined-model reporting is
+explicit and preserves the other workload and measurement boundaries.
 
-    python scripts/report.py results/qwen3-1.7b-vllm-*.jsonl
+    python scripts/report.py results/qwen3-1.7b-llama_cpp-*.jsonl
 """
 
 from __future__ import annotations
@@ -22,17 +22,17 @@ import argparse
 import glob
 import json
 import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
 def load(patterns: list[str]) -> list[dict]:
     rows = []
     for pat in patterns:
         for path in sorted(glob.glob(pat)):
-            with open(path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        rows.append(json.loads(line))
+            from edge_llm_pareto.results import read_records
+            rows.extend(r for r in read_records(path)
+                        if r.get('scenario') not in ('system_baseline', 'server_idle'))
     return rows
 
 
@@ -58,17 +58,46 @@ def pareto(rows: list[dict]) -> list[dict]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("results", nargs="+", help="jsonl paths or globs")
+    ap.add_argument("--energy", action="store_true")
+    ap.add_argument("--export-dir", default="results/report")
+    ap.add_argument("--objective", choices=["output_tok_s", "latency_s_p95"], default="output_tok_s")
+    ap.add_argument("--baseline", help="configuration ID to compare within its matching group")
+    ap.add_argument("--min-quality", type=float)
+    ap.add_argument('--perplexity-results', nargs='+', help='JSON bundles from perplexity.py')
+    ap.add_argument('--max-perplexity-increase-pct', type=float)
+    ap.add_argument('--combine-models', action='store_true', help='compare models on matched workloads; relative PPL loss is not equal task quality')
     args = ap.parse_args()
+    if (args.perplexity_results or args.max_perplexity_increase_pct is not None or args.combine_models) and not args.energy:
+        ap.error('perplexity and combined-model options require --energy')
+    if args.max_perplexity_increase_pct is not None and not args.perplexity_results:
+        ap.error('perplexity filtering requires --perplexity-results')
 
     rows = load(args.results)
     if not rows:
         print("no rows found", file=sys.stderr)
         return 1
 
+    if args.energy:
+        from edge_llm_pareto.analysis import export
+        try:
+            if args.perplexity_results:
+                from edge_llm_pareto.perplexity import attach_results
+                from pathlib import Path
+                rows = attach_results(rows, [json.loads(Path(p).read_text()) for p in args.perplexity_results])
+            data = export(rows, args.export_dir, args.objective, args.baseline, args.min_quality,
+                          args.max_perplexity_increase_pct, args.combine_models)
+            if args.combine_models and args.min_quality is None:
+                print('Combined frontier compares efficiency; relative perplexity loss does not establish equal task quality.')
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"Exported {len(data)} configurations to {args.export_dir}")
+        return 0
+
     skipped = [r for r in rows if r.get("skipped")]
     done = [r for r in rows if not r.get("skipped")]
 
-    print(f"{'rung':<15}{'conc':>5}{'tot tok/s':>11}{'per-agent':>11}"
+    print(f"{'engine':<11}{'rung':<20}{'conc':>5}{'tot tok/s':>11}{'per-agent':>11}"
           f"{'ttft s':>9}{'sm%':>6}{'mem%':>6}{'ceil':>6}  note")
     for r in sorted(done, key=lambda r: (r["label"], r["concurrency"])):
         g = r.get("gpu", {})
@@ -84,19 +113,19 @@ def main() -> int:
         ceil = r.get("kv_ceiling_agents")
         if ceil and r["concurrency"] > ceil:
             note.append("above KV ceiling: queueing, not parallel decode")
-        print(f"{r['label']:<15}{r['concurrency']:>5}{r['output_tok_s']:>11.1f}"
+        print(f"{r.get('engine', 'unknown'):<11}{r['label']:<20}{r['concurrency']:>5}{r['output_tok_s']:>11.1f}"
               f"{r.get('per_agent_tok_s') or 0:>11.1f}{r.get('ttft_s_mean') or 0:>9.2f}"
               f"{g.get('sm_util_pct_mean', 0):>6.0f}{g.get('mem_util_pct_mean', 0):>6.0f}"
               f"{ceil if ceil else '-':>6}  {'; '.join(note)}")
 
     for r in skipped:
-        print(f"{r['label']:<15}{'-':>5}{'skipped':>11}  {r.get('reason')}")
+        print(f"{r.get('engine', 'unknown'):<11}{r['label']:<20}{'-':>5}{'skipped':>11}  {r.get('reason')}")
 
     front = pareto(done)
     if front:
         print("\npareto front (nothing beats these on both throughput and per-agent speed):")
         for r in front:
-            print(f"  {r['label']} @ concurrency {r['concurrency']}: "
+            print(f"  {r.get('engine', 'unknown')}/{r['label']} @ concurrency {r['concurrency']}: "
                   f"{r['output_tok_s']:.1f} tok/s total, "
                   f"{r['per_agent_tok_s']:.1f} tok/s per agent")
 

@@ -4,18 +4,14 @@ version = "0.1.0"
 description = "Pareto fronts for edge LLM serving: quantization x concurrency on a memory-constrained GPU"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "vllm==0.27.1",
     "openai>=1.40",
-    "huggingface-hub[hf-transfer]>=0.26",
+    "huggingface-hub>=0.26",
     "nvidia-ml-py>=12.560",
     "pyyaml>=6.0",
     "pandas>=2.2",
     "matplotlib>=3.9",
+    "sacrebleu>=2.5,<3",
 ]
-
-[project.optional-dependencies]
-# vLLM moved bitsandbytes support out into a plugin; only needed for the bnb rungs.
-bnb = ["vllm-bnb-plugin"]
 
 [build-system]
 requires = ["hatchling"]

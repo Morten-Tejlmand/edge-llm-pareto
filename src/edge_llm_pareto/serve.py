@@ -22,7 +22,7 @@ class ServerHandle:
     def stop(self, timeout: float = 30.0) -> None:
         if self.proc.poll() is not None:
             return
-        # vLLM spawns worker processes; signal the whole group.
+        # Signal the server process group.
         try:
             os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
         except ProcessLookupError:
@@ -40,49 +40,6 @@ class ServerHandle:
         self.stop()
 
 
-def vllm_command(
-    repo: str,
-    *,
-    quantization: str | None = None,
-    max_model_len: int = 4096,
-    max_num_seqs: int = 32,
-    gpu_memory_utilization: float = 0.70,
-    kv_cache_dtype: str = "auto",
-    kv_offloading_gib: float | None = None,
-    enforce_eager: bool = False,
-    port: int = 8000,
-    extra: list[str] | None = None,
-) -> list[str]:
-    cmd = [
-        "vllm", "serve", repo,
-        "--host", "127.0.0.1",
-        "--port", str(port),
-        "--max-model-len", str(max_model_len),
-        "--max-num-seqs", str(max_num_seqs),
-        "--gpu-memory-utilization", str(gpu_memory_utilization),
-        "--kv-cache-dtype", kv_cache_dtype,
-        # Each benchmark request gets a unique prefix, but disable the cache
-        # explicitly so a rerun cannot be contaminated by a warm cache.
-        "--no-enable-prefix-caching",
-    ]
-    if kv_offloading_gib:
-        # vLLM 0.27 replaced the old --swap-space with explicit KV offloading.
-        # Spilling KV to host RAM raises the agent ceiling past what 6 GiB of
-        # VRAM allows -- at the cost of PCIe transfers, so it is its own axis
-        # rather than a default.
-        cmd += ["--kv-offloading-size", str(kv_offloading_gib),
-                "--kv-offloading-backend", "native"]
-    if quantization:
-        cmd += ["--quantization", quantization]
-    if enforce_eager:
-        # Saves ~400-600 MiB of CUDA graph pools but slows decode measurably.
-        # Only for rungs that otherwise refuse to fit; note it in results.
-        cmd += ["--enforce-eager"]
-    if extra:
-        cmd += extra
-    return cmd
-
-
 def llama_server_command(
     gguf_path: str,
     *,
@@ -90,29 +47,114 @@ def llama_server_command(
     ctx_size: int = 4096,
     parallel: int = 32,
     port: int = 8000,
+    executable: str = "llama-server",
+    alias: str = "benchmark",
     extra: list[str] | None = None,
 ) -> list[str]:
-    """llama.cpp equivalent. --parallel splits the KV cache into that many slots,
-    so ctx_size here is *per slot* -- the analogue of vLLM's max_model_len."""
+    """Build a llama.cpp command with ctx_size tokens per parallel slot."""
     cmd = [
-        "llama-server", "-m", gguf_path,
+        executable, "-m", gguf_path,
+        "--host", "127.0.0.1",
         "--port", str(port),
+        "--alias", alias,
+        "--predict", "-1",
+        "--device", "CUDA0",
         "-ngl", str(n_gpu_layers),
         "-c", str(ctx_size * parallel),
         "--parallel", str(parallel),
-        "--no-mmap",
+        "--load-mode", "none",
+        "--fit", "off",
+        "--no-kv-unified",
+        "--cache-type-k", "f16", "--cache-type-v", "f16",
+        "--cache-ram", "0",
+        "--no-cache-prompt",
+        "--no-context-shift",
+        "--jinja",
+        # Keep Qwen thinking tokens in content so the stream timer observes them.
+        "--reasoning-format", "none",
     ]
     if extra:
         cmd += extra
     return cmd
 
 
+def download_gguf(repo: str, filename: str, revision: str = "main") -> dict:
+    """Resolve a GGUF (including split files) at one immutable HF revision."""
+    import re
+    from huggingface_hub import HfApi, hf_hub_download
+
+    info = HfApi().model_info(repo, revision=revision)
+    names = [s.rfilename for s in info.siblings]
+    if filename in names:
+        selected = filename
+    else:
+        # Publishers sometimes move the same file into a quantization folder.
+        matches = [n for n in names if pathlib.PurePosixPath(n).name == filename]
+        if not matches:
+            stem = re.escape(filename.removesuffix(".gguf"))
+            matches = [n for n in names if re.fullmatch(
+                rf"{stem}-00001-of-\d{{5}}\.gguf", pathlib.PurePosixPath(n).name)]
+        if len(matches) != 1:
+            raise ValueError(f"Expected one GGUF matching {filename} in {repo}; found {matches}")
+        selected = matches[0]
+
+    split = re.fullmatch(r"(.*)-(\d{5})-of-(\d{5})\.gguf", selected)
+    files = [selected]
+    if split:
+        prefix, _, count = split.groups()
+        files = [f"{prefix}-{i:05d}-of-{count}.gguf" for i in range(1, int(count) + 1)]
+        if not files or any(f not in names for f in files):
+            raise ValueError(f"Incomplete GGUF shard set: {selected}")
+    paths = [hf_hub_download(repo_id=repo, filename=f, revision=info.sha) for f in files]
+    return {"path": paths[0], "repo": repo, "revision": info.sha, "files": files}
+
+
+def resolve_hf_revision(repo: str, revision: str = "main") -> str:
+    """Pin native weights before vLLM downloads them."""
+    from huggingface_hub import HfApi
+    return HfApi().model_info(repo, revision=revision).sha
+
+
+def vllm_server_command(model: str, *, revision: str, alias: str,
+                        executable: str = "vllm", ctx_size: int = 4096,
+                        parallel: int = 16, port: int = 8000,
+                        gpu_memory_utilization: float = .7,
+                        kv_cache_memory_bytes: int | None = None,
+                        dtype: str = "bfloat16", quantization: str | None = None,
+                        tokenizer: str | None = None,
+                        tokenizer_revision: str | None = None) -> list[str]:
+    """Native vLLM serving; GGUF requires the separate vLLM GGUF plugin.
+
+    Leave compilation and continuous batching enabled. Explicit KV bytes honor
+    the host-aware planner on unified memory; utilization alone uses GPU counters.
+    """
+    cmd = [executable, "serve", model, "--host", "127.0.0.1",
+           "--port", str(port), "--served-model-name", alias,
+           "--revision", revision, "--max-model-len", str(ctx_size),
+           "--max-num-seqs", str(parallel), "--dtype", dtype,
+           "--kv-cache-dtype", dtype,
+           "--gpu-memory-utilization", str(gpu_memory_utilization),
+           "--disable-prefix-caching", "--generation-config", "vllm"]
+    if kv_cache_memory_bytes is not None:
+        cmd += ["--kv-cache-memory-bytes", str(kv_cache_memory_bytes)]
+    if quantization:
+        cmd += ["--quantization", quantization]
+    if tokenizer:
+        cmd += ["--tokenizer", tokenizer, "--tokenizer-revision", tokenizer_revision or revision]
+    return cmd
+
+
+def executable_version(executable: str) -> str:
+    result = subprocess.run([executable, "--version"], capture_output=True,
+                            text=True, check=True, timeout=30)
+    return (result.stdout + result.stderr).strip()
+
+
 def resolve_executable(name: str) -> str:
     """Find `name` on PATH, else next to the running interpreter.
 
     Running as `.venv/bin/python scripts/sweep.py` does not put the venv's bin
-    directory on PATH, so a plain PATH lookup misses the `vllm` sitting right
-    beside the interpreter that imported this module.
+    directory on PATH; also check beside the interpreter.
     """
     found = shutil.which(name)
     if found:
@@ -122,75 +164,23 @@ def resolve_executable(name: str) -> str:
         return str(sibling)
     raise FileNotFoundError(
         f"{name!r} not found on PATH or in {sibling.parent}. "
-        f"For vllm: `uv sync`; for llama-server: see docs/engines.md"
+        "For llama-server build instructions, see docs/engines.md"
     )
 
 
-def find_cuda_home() -> str | None:
-    """Locate a CUDA toolkit inside the venv.
-
-    vLLM's warm-up JIT-compiles FlashInfer kernels, which needs `nvcc`. There is
-    no system CUDA toolkit here, but the nvidia pip wheels torch pulls in ship a
-    complete one (nvcc + headers + libs) under site-packages/nvidia/cuXX.
-    FlashInfer only checks $CUDA_HOME and /usr/local/cuda, so it has to be
-    pointed at that tree explicitly or startup dies after several minutes of
-    otherwise-successful loading.
-    """
-    if os.environ.get("CUDA_HOME"):
-        return os.environ["CUDA_HOME"]
-    site = pathlib.Path(sys.executable).parent.parent / "lib"
-    for nvidia_dir in sorted(site.glob("python*/site-packages/nvidia")):
-        # Prefer the highest CUDA major version present.
-        for cu in sorted(nvidia_dir.glob("cu*"), reverse=True):
-            if (cu / "bin" / "nvcc").exists():
-                return str(cu)
-    return None
-
-
-def host_compiler_too_new() -> bool:
-    """CUDA 13.3 rejects GCC > 15; Fedora 44 ships GCC 16.
-
-    nvcc refuses to compile at all against a newer host compiler, so any JIT
-    path is dead until either an older gcc is installed or the JIT is avoided.
-    """
-    try:
-        out = subprocess.run(["gcc", "-dumpversion"], capture_output=True,
-                             text=True, timeout=10).stdout.strip()
-        return int(out.split(".")[0]) > 15
-    except Exception:
-        return False
-
-
-def server_env() -> dict[str, str]:
-    env = dict(os.environ)
-    cuda_home = find_cuda_home()
-    if cuda_home:
-        env["CUDA_HOME"] = cuda_home
-        env["PATH"] = f"{cuda_home}/bin:" + env.get("PATH", "")
-
-    # FlashInfer JIT-compiles its sampling kernels at startup. With GCC 16 as
-    # the host compiler that build fails and takes the whole engine down, so
-    # fall back to vLLM's native sampler. At temperature=0 sampling is argmax,
-    # so this is not a meaningful throughput difference -- but it is recorded in
-    # run metadata because it is a deviation from the default path.
-    if host_compiler_too_new():
-        env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
-    return env
-
-
-def start(cmd: list[str], log_path: str, port: int = 8000) -> ServerHandle:
+def start(cmd: list[str], log_path: str, port: int = 8000,
+          env: dict[str, str] | None = None) -> ServerHandle:
     cmd = [resolve_executable(cmd[0]), *cmd[1:]]
-    log = open(log_path, "w")
-    proc = subprocess.Popen(
-        cmd, stdout=log, stderr=subprocess.STDOUT,
-        start_new_session=True, env=server_env(),
-    )
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            cmd, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True, env=env,
+        )
     return ServerHandle(proc, f"http://127.0.0.1:{port}/v1", log_path)
 
 
 def wait_ready(h: ServerHandle, timeout_s: float = 600.0, poll_s: float = 2.0) -> bool:
-    """vLLM startup is slow (weight load + torch.compile + graph capture), so the
-    default timeout is generous. Returns False if the process died instead."""
+    """Allow time for model loading; return False if the server process dies."""
     health = h.base_url.rsplit("/v1", 1)[0] + "/health"
     deadline = time.time() + timeout_s
     while time.time() < deadline:

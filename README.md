@@ -4,24 +4,56 @@ Benchmark **quantization × concurrency on NVIDIA DGX Spark / GB10 with 128 GB
 unified CPU/GPU memory**. The experiment measures how compression changes total
 throughput, streaming speed and latency as concurrent requests increase.
 
+## Revised study and vLLM
+
+The [updated experiment plan](docs/study-plan.md) targets **two models × three
+weight representations × two engines × five concurrency levels × 30 trials**:
+60 configurations and 1,800 measured trials. Native vLLM rows (publisher BF16,
+official Qwen FP8) add 15 configurations so optimized vLLM is measured too:
+75 configurations and 2,250 trials in total. It covers current Qwen/DeepSeek
+candidates, Unsloth versus official quantization, variability and OpenAI speed tiers.
+
+The plan also adopts [Guldner et al.'s GSMM (2024)](https://doi.org/10.1016/j.future.2024.01.033)
+as its measurement reference framework, with a [study-specific mapping](docs/study-plan.md#measurement-methodology-gsmm)
+covering goals, metrics, procedure, setup, evaluation and baseline/idle measurements.
+
+Add `--gsmm` to a sweep to record a system baseline before each variant launch
+and server idle before each trial (30 seconds each, configurable). Results retain
+raw reference traces, environment/sensor metadata and separately labeled adjusted
+energy estimates. Gross energy remains the Pareto objective. Sensor validation
+and pilot stabilization checks still need to be completed on the Spark.
+
+The sweep now accepts `--engine vllm` with a separately provisioned
+[GB10 vLLM runtime](docs/engines.md#vllm). `configs/study.yaml` supplies Qwen3.8-27B
+and an explicitly older DeepSeek 8B pilot fallback: the latest DeepSeek V4.1
+high-precision reference cannot fit on one Spark. Native vLLM and experimental
+same-GGUF engine comparisons are separate groups; `scripts/qa_study.py` runs both. The commands below retain the original
+llama.cpp smoke-test defaults.
+
 ## Run on the Spark
 
-Run from the repository root using the native Python environment. See
-[engine setup](docs/engines.md) for setup and GB10 validation requirements.
+The backend is **llama.cpp**, using GGUF models and a CUDA
+`llama-server` binary. First [build llama-server](docs/engines.md#build-on-the-spark).
+Then run from this repository:
 
 ```bash
 uv sync
+export PATH="$HOME/llama.cpp/build/bin:$PATH"
 .venv/bin/python scripts/check_spark.py
 .venv/bin/python scripts/budget.py
 
-# Smoke test: one model, BF16, concurrency 1, one request:
+# Smoke test: Qwen3-1.7B Q4_K_M, concurrency 1, one request:
 .venv/bin/python scripts/sweep.py
 
-# Full vLLM sweeps, one model at a time:
+# Full GGUF sweeps, one model at a time:
 .venv/bin/python scripts/sweep.py --model qwen3-1.7b --rung all --concurrency all --requests-per-agent 3
 .venv/bin/python scripts/sweep.py --model qwen3-4b-2507 --rung all --concurrency all --requests-per-agent 3
-.venv/bin/python scripts/report.py 'results/qwen3-1.7b-vllm-*.jsonl'
+.venv/bin/python scripts/report.py 'results/qwen3-1.7b-llama_cpp-*.jsonl'
 ```
+
+Alternatively, pass `--llama-server /path/to/llama-server` to the runtime check
+and sweep. GGUF weights download automatically. `uv sync` installs the Python
+benchmark tools; the C++ server is built separately.
 
 Results and server logs are written to `results/`. Model downloads use the
 Hugging Face cache; set `HF_TOKEN` when authentication is required.
@@ -37,9 +69,15 @@ GPU. It downloads only model configuration JSON. Real runs always probe the GB10
 and use OS-reported physical memory, which can be smaller than nominal capacity.
 The sweep refuses a different GPU to avoid accidentally collecting laptop data.
 
+Performance requests default to a **256-output-token cap**, configurable with
+`--output-tokens`. QA is uncapped by default within the configured context;
+`--quality-max-tokens` sets its independent limit (`--max-tokens` for standalone
+`evaluate.py`). Both paths retain actual output counts and termination reasons.
+Context boundaries and existing request timeouts still apply.
+
 ## Memory defaults
 
-- **70% process memory utilization**, passed explicitly to vLLM.
+- **70% memory planning budget** for llama.cpp slot estimates; no enforced process cap.
 - **16 GiB additional host headroom** below current `MemAvailable`.
 - **4 GiB estimated runtime overhead**, subtracted before estimating KV capacity.
 - **4096 tokens per context**, default concurrency **1**, **one request**.
@@ -54,20 +92,23 @@ VRAM counters. Swap is not counted as capacity. These are starting settings,
 Both budget and sweep accept `--gpu-mem-util`, `--host-reserve-gib`, and
 `--runtime-overhead-gib`; use the same values for both. Longer contexts and higher
 concurrency increase runtime requirements; compare estimates with server logs.
+For llama.cpp these memory settings guide slot allocation only; they do not
+enforce a process memory cap. KV uses f16 and each slot receives `--context` tokens.
 
 ## Models and measurements
 
-| Base model | vLLM precision variants | Configured GGUF variants |
-|---|---:|---:|
-| Qwen3-1.7B | 7 | 7 |
-| Qwen3-4B-Instruct-2507 | 4 | 2 |
+| Base model | Configured GGUF variants |
+|---|---:|
+| Qwen3-1.7B | 7 |
+| Qwen3-4B-Instruct-2507 | 5 |
 
-The default command tests **Qwen3-1.7B BF16 with one request at concurrency 1**.
+The default command tests **Qwen3-1.7B GGUF Q4_K_M with one request at concurrency 1**.
 Use `--rung all --concurrency all --requests-per-agent 3` for full sweeps: up to
-42 points for 1.7B or 24 for 4B. Unsupported variants are recorded as skipped.
+42 points for 1.7B or 30 for 4B.
+Unsupported variants are recorded as skipped.
 The command exits with an error if no benchmark point succeeds. BF16 is included
-for both models. GGUF configurations and launcher helpers exist, but automated
-llama.cpp sweeps remain unimplemented.
+for the 1.7B model. The llama.cpp backend downloads configured GGUF files
+automatically and records the resolved model revision and server build.
 
 Requests are synthetic long-prompt summarization workloads, not tool-using
 agents. Recorded metrics include aggregate output tokens/s, streaming chunk
@@ -75,10 +116,11 @@ latency, time to first content, total request latency, and available GPU telemet
 `per_agent_tok_s` is the reciprocal of mean content-chunk spacing; it excludes
 initial queueing/prefill and is approximate when chunks contain multiple tokens.
 
-The report computes a speed-only Pareto front. Compare one base model and matching
+The default report computes a speed-only Pareto front; `--energy` produces
+energy–throughput or energy–latency frontiers with trial uncertainty and exports. Compare one base model and matching
 workloads/runtime settings at a time. It excludes rows explicitly tagged throttled
 or containing failed requests. Activity counters alone cannot establish a
-memory-bandwidth/compute crossover. Accuracy evaluation is still needed.
+memory-bandwidth/compute crossover. A fixed-task quality evaluator is available; representative evaluation data is still needed.
 
 ## Layout and validation
 
@@ -91,3 +133,35 @@ memory-bandwidth/compute crossover. Accuracy evaluation is still needed.
 Local regression tests: `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v`.
 The native runtime and actual model/kernel execution must be validated on
 the Spark. No GB10 performance results are claimed by this setup.
+
+## Research experiment pipeline
+
+See [the experiment guide](docs/experiments.md) for repeated trials, warmup,
+seeded ordering, resume, timestamped energy measurements, Jetson adapters,
+quality evaluation, and energy Pareto plots. The default commands above remain
+smoke tests; they do not enable a research measurement protocol automatically.
+
+
+### Where the Python code lives
+
+- `scripts/` contains terminal entry points: use `sweep.py` to run experiments,
+  `report.py` to report results, and `evaluate.py` to score model answers.
+- `src/edge_llm_pareto/` contains reusable functions imported by those commands.
+  `bench.py` sends requests, `telemetry.py` collects hardware samples with one
+  monitor, and `energy.py` integrates those samples into joules.
+
+Workloads and request results are ordinary dictionaries. For example:
+
+```python
+from edge_llm_pareto.bench import make_workload, make_prompt
+
+workload = make_workload(prompt_tokens=2000)
+prompt = make_prompt(workload, seed=0)
+print(workload["max_output_tokens"])  # 256
+```
+
+The monitor remains a class because it owns a background thread and must stop it
+and release NVML when a run ends. Its samples are dictionaries too; GPU summaries
+and energy calculations use the same samples.
+
+Fixed-corpus research controls: [perplexity, fixed prompts, server slots, and combined-model reports](docs/experiments.md#fixed-corpus-study-perplexity-and-generation).

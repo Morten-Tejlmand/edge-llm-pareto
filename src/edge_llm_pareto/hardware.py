@@ -46,6 +46,10 @@ class ModelShape:
 
     @classmethod
     def from_config(cls, cfg: dict, name: str) -> "ModelShape":
+        # Multimodal checkpoints keep the language architecture in text_config.
+        # Hybrid attention is approximated as full attention at every layer;
+        # recurrent-state/vision allocations still need runtime validation.
+        cfg = cfg.get("text_config", cfg)
         heads = cfg["num_attention_heads"]
         return cls(
             name=name,
@@ -182,6 +186,12 @@ def _gpu_from_values(name: str, cap: str, total=None, used=None) -> Gpu:
 
 def probe_gpu(index: int = 0) -> Gpu:
     """Identify GB10 before requesting unsupported framebuffer memory counters."""
+    from .telemetry import is_jetson
+    if is_jetson():
+        from pathlib import Path
+        total, available = system_memory_mib()
+        name = Path("/proc/device-tree/model").read_text().strip("\x00\n")
+        return Gpu(name, total, total - available, "unknown", True, "/proc/meminfo")
     try:
         return _probe_nvml(index)
     except Exception:
@@ -328,7 +338,7 @@ def probe_power_state(index: int = 0) -> PowerState:
 
 
 def check_benchmark_conditions(
-    ps: PowerState, min_clock_fraction: float = 0.5
+    ps: PowerState, min_clock_fraction: float = 0.5, intentional_power_limit: bool = False
 ) -> list[str]:
     """Reasons the machine is unfit to produce comparable timings."""
     problems = []
@@ -337,12 +347,12 @@ def check_benchmark_conditions(
             "running on battery -- the GPU is power-capped and timings are meaningless"
         )
     throttles = ps.throttle_reasons
-    if any("Power Cap" in r or "Slowdown" in r for r in throttles):
+    if any("Slowdown" in r or ("Power Cap" in r and not intentional_power_limit) for r in throttles):
         problems.append(f"GPU throttled: {', '.join(throttles)}")
     frac = ps.clock_fraction
     # Only meaningful under load; at idle a low clock is correct. The sweep
     # records sampled clocks during the run for later inspection.
-    if frac is not None and frac < min_clock_fraction and (ps.power_w or 0) > 15:
+    if not intentional_power_limit and frac is not None and frac < min_clock_fraction and (ps.power_w or 0) > 15:
         problems.append(
             f"SM clock at {ps.sm_clock_mhz}/{ps.sm_clock_max_mhz} MHz "
             f"({frac:.0%} of peak) under load"

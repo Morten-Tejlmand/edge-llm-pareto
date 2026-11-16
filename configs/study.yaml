@@ -1,0 +1,71 @@
+# Proposed study, reviewed 2026-11-14. Explicit rung lists keep native-engine
+# pilots separate from the three-representation GGUF comparison.
+# DeepSeek here is a disclosed small pilot fallback, NOT the latest V4.1 model.
+defaults:
+  kv_dtype_bytes: 2
+  embedding_bits: 16
+concurrency: [1, 2, 4, 8, 16]
+# Main QA workload; perplexity stays available as a separate optional evaluation.
+study:
+  qa_dataset: data/squad-dev-100.jsonl
+  engines: [llama_cpp, vllm]
+  repeats: 30
+  requests_per_agent: 100
+  warmup_requests: 4
+  output_tokens: 256
+  context: 4096
+  server_parallel: 16
+  seed: 42
+  model_rungs:
+    qwen3.8-27b: [gguf-bf16, gguf-q8_0, gguf-ud-q4_k_xl]
+    deepseek-r1-0528-qwen3-8b: [gguf-bf16, gguf-q8_0, gguf-q4_k_m]
+  # Optimized native vLLM deployment (safetensors, continuous batching, compiled
+  # kernels). A second comparison, not part of the same-artifact GGUF matrix:
+  # weight format and quantization recipe change together with the engine.
+  # DeepSeek has no official quantized checkpoint configured, so BF16 only.
+  native_vllm_rungs:
+    qwen3.8-27b: [native-bf16, official-fp8]
+    deepseek-r1-0528-qwen3-8b: [native-bf16]
+models:
+  qwen3.8-27b:
+    shape_from: Qwen/Qwen3.8-27B
+    params: 27000000000
+    budget_note: "Hybrid text/vision model: dense-equivalent weights and full-attention KV estimates are provisional; recurrent state, vision allocations and kernel support need Spark validation."
+    engine_rungs:
+      llama_cpp:
+        repo: unsloth/Qwen3.8-27B-GGUF
+        default_rung: gguf-ud-q4_k_xl
+        rungs:
+          - {rung: gguf-bf16, file: Qwen3.8-27B-BF16.gguf, linear_bits: 16}
+          - {rung: gguf-q8_0, file: Qwen3.8-27B-Q8_0.gguf, linear_bits: 8}
+          - {rung: gguf-ud-q4_k_xl, file: Qwen3.8-27B-UD-Q4_K_XL.gguf, linear_bits: 4.5}
+      vllm:
+        repo: unsloth/Qwen3.8-27B-GGUF
+        default_rung: native-bf16
+        # GGUF rows require the vLLM GGUF plugin and are experimental. They
+        # measure identical artifacts across engines, not optimized native vLLM.
+        rungs:
+          - {rung: native-bf16, repo: Qwen/Qwen3.8-27B, linear_bits: 16, dtype: bfloat16}
+          - {rung: official-fp8, repo: Qwen/Qwen3.8-27B-FP8, linear_bits: 8, dtype: bfloat16}
+          - {rung: gguf-bf16, file: Qwen3.8-27B-BF16.gguf, linear_bits: 16, dtype: float16}
+          - {rung: gguf-q8_0, file: Qwen3.8-27B-Q8_0.gguf, linear_bits: 8, dtype: float16}
+          - {rung: gguf-ud-q4_k_xl, file: Qwen3.8-27B-UD-Q4_K_XL.gguf, linear_bits: 4.5, dtype: float16}
+  deepseek-r1-0528-qwen3-8b:
+    shape_from: deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
+    params: 8190000000
+    engine_rungs:
+      llama_cpp:
+        repo: unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF
+        default_rung: gguf-q4_k_m
+        rungs:
+          - {rung: gguf-bf16, file: DeepSeek-R1-0528-Qwen3-8B-BF16.gguf, linear_bits: 16}
+          - {rung: gguf-q8_0, file: DeepSeek-R1-0528-Qwen3-8B-Q8_0.gguf, linear_bits: 8}
+          - {rung: gguf-q4_k_m, file: DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf, linear_bits: 4.5}
+      vllm:
+        repo: unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF
+        default_rung: native-bf16
+        rungs:
+          - {rung: native-bf16, repo: deepseek-ai/DeepSeek-R1-0528-Qwen3-8B, linear_bits: 16, dtype: bfloat16}
+          - {rung: gguf-bf16, file: DeepSeek-R1-0528-Qwen3-8B-BF16.gguf, linear_bits: 16, dtype: float16}
+          - {rung: gguf-q8_0, file: DeepSeek-R1-0528-Qwen3-8B-Q8_0.gguf, linear_bits: 8, dtype: float16}
+          - {rung: gguf-q4_k_m, file: DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf, linear_bits: 4.5, dtype: float16}
