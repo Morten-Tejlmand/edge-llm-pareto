@@ -63,6 +63,8 @@ def build(records, config):
         row = dict(base_model=model, engine=engine, label=label, model_repo=rec['model_repo'],
                    model_revision=rec['model_revision'], top_k=rec['top_k'],
                    tokenizer_matches_frozen_ids=rec['tokenizer_matches_frozen_ids'],
+                   tokenizer_encode_ok=rec['tokenizer_check']['encode_ok'],
+                   tokenizer_decode_ok=rec['tokenizer_check']['decode_ok'],
                    **{k: rec['summary'][k] for k in ('items', 'answer_tokens', 'answer_nll', 'answer_ppl')})
         for prefix, ref in (('engine_bf16', reference_for(records, config, model, engine)),
                             ('llama_cpp_bf16', reference_for(records, config, model, COMMON_REFERENCE_ENGINE))):
@@ -109,7 +111,8 @@ def main():
         print(f"{r['base_model']:<28}{r['engine']:<11}{r['label']:<18}{r['answer_tokens']:>7}"
               f"{fmt(r['answer_ppl'], '.3f'):>9}{fmt(r.get('kl_to_engine_bf16')):>9}"
               f"{fmt(r.get('top1_agreement_engine_bf16'), '.3f'):>9}{fmt(r.get('kl_to_llama_cpp_bf16')):>10}"
-              + ('' if r['tokenizer_matches_frozen_ids'] else '  tokenizer differs from frozen IDs'))
+              + ('' if r['tokenizer_encode_ok'] else '  TOKENIZER ENCODE MISMATCH')
+              + ('' if r['tokenizer_decode_ok'] else '  TOKENIZER DECODE MISMATCH'))
     print(f'\nKL: {KL_METHOD} (approximation of full-vocabulary KL). Wrote {out} and {out.with_suffix(".csv")}')
     return 0
 

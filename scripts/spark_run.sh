@@ -9,6 +9,8 @@
 #   scripts/spark_run.sh smoke   # setup + one quick trial per engine (~30 min)
 #   scripts/spark_run.sh pilot   # smoke + pilot subset (~11 h estimate)
 #   scripts/spark_run.sh full    # smoke + full study, 1,500 trials (re-estimate from pilot)
+#   scripts/spark_run.sh vllm-check  # vLLM only: every vLLM row once (DeepSeek first),
+#                                    # then tokenizer check, likelihood and QA summary
 #
 # Optional environment variables:
 #   LLAMA_SERVER=/path/to/llama-server   use an existing build instead of building
@@ -21,8 +23,8 @@
 set -euo pipefail
 
 MODE="${1:-pilot}"
-case "$MODE" in smoke|pilot|full) ;; *)
-  echo "Usage: $0 [smoke|pilot|full]" >&2; exit 2;; esac
+case "$MODE" in smoke|pilot|full|vllm-check) ;; *)
+  echo "Usage: $0 [smoke|pilot|full|vllm-check]" >&2; exit 2;; esac
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -62,7 +64,10 @@ PY="$ROOT/.venv/bin/python"
 
 # ---------------------------------------------------------------- llama.cpp
 step "llama.cpp server"
-if [ -n "${LLAMA_SERVER:-}" ]; then
+if [ "$MODE" = "vllm-check" ]; then
+  echo "vllm-check: llama.cpp is not used."
+  LLAMA_SERVER="${LLAMA_SERVER:-llama-server}"
+elif [ -n "${LLAMA_SERVER:-}" ]; then
   [ -x "$LLAMA_SERVER" ] || die "LLAMA_SERVER=$LLAMA_SERVER is not executable."
 else
   LLAMA_CPP_DIR="${LLAMA_CPP_DIR:-$HOME/llama.cpp}"
@@ -80,14 +85,17 @@ else
   fi
   echo "llama.cpp commit: $(git -C "$LLAMA_CPP_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
 fi
-"$LLAMA_SERVER" --version || true
-"$LLAMA_SERVER" --list-devices 2>&1 | tee /dev/stderr | grep CUDA0 >/dev/null \
-  || die "llama-server does not list CUDA0: it was not built with CUDA for this GPU."
-"$PY" scripts/check_spark.py --llama-server "$LLAMA_SERVER"
+if [ "$MODE" != "vllm-check" ]; then
+  "$LLAMA_SERVER" --version || true
+  "$LLAMA_SERVER" --list-devices 2>&1 | tee /dev/stderr | grep CUDA0 >/dev/null \
+    || die "llama-server does not list CUDA0: it was not built with CUDA for this GPU."
+  "$PY" scripts/check_spark.py --llama-server "$LLAMA_SERVER"
+fi
 
 # ---------------------------------------------------------------- vLLM
 step "vLLM runtime"
 ENGINES="${ENGINES:-llama_cpp,vllm}"
+[ "$MODE" = "vllm-check" ] && ENGINES="vllm"
 find_vllm() {  # first working vllm: $VLLM, PATH, then common virtualenv locations
   local candidate
   for candidate in "${VLLM:-}" "$(command -v vllm 2>/dev/null || true)" \
@@ -127,11 +135,13 @@ else
   echo "WARNING: no working vLLM found (searched \$VLLM, PATH, ~/vllm-env and other ~/*/bin)."
   echo "         Set it up with NVIDIA's Spark vLLM playbook;"
   echo "         see docs/engines.md. Continuing with llama.cpp only."
+  [ "$MODE" = "vllm-check" ] && die "vllm-check needs a working vLLM (set VLLM=/path/to/vllm)."
   ENGINES="llama_cpp"
   VLLM="vllm"
 fi
 
 # ---------------------------------------------------------------- downloads
+if [ "$MODE" != "vllm-check" ]; then
 step "Downloading pinned Unsloth GGUF files (reuses the Hugging Face cache)"
 "$PY" - <<'EOF'
 import sys, yaml
@@ -145,6 +155,7 @@ for model, rungs in cfg['study']['model_rungs'].items():
         result = serve.download_gguf(engine['repo'], files[rung], engine['revision'])
         print(f"  ok  {model} {rung} @ {result['revision'][:12]}: {', '.join(result['files'])}", flush=True)
 EOF
+fi
 
 COMMON=(--engines "$ENGINES" --llama-server "$LLAMA_SERVER" --vllm "$VLLM")
 
@@ -186,6 +197,40 @@ for path in glob.glob(f'{sys.argv[1]}/*.jsonl'):
 print(n)
 EOF
 }
+
+# ---------------------------------------------------------------- vLLM check
+if [ "$MODE" = "vllm-check" ]; then
+  OUT="results/vllm-check-$STAMP"
+  # DeepSeek first: small, and the model with the known vLLM tokenizer problem.
+  for model in deepseek-r1-0528-qwen3-8b qwen3.8-27b; do
+    step "vLLM check: $model, every vLLM row, concurrency 1, one trial"
+    run_study "$OUT" --models "$model" --concurrency 1 --repeats 1 \
+      || echo "Some $model cells failed; continuing."
+  done
+  step "vLLM check summary"
+  echo "Skipped/failed rows: $(skipped_rows "$OUT")"
+  "$PY" scripts/likelihood_report.py "$OUT/*.likelihood.json" --output "$OUT/report/likelihood.json" \
+    || echo "No likelihood results; see the sweep output above."
+  "$PY" - "$OUT" <<'EOF'
+import glob, json, sys
+print(f"\n{'model':<28}{'rung':<16}{'QA EM':>7}{'hit cap':>9}  first answer (raw, decoding check)")
+for path in sorted(glob.glob(f'{sys.argv[1]}/*.jsonl')):
+    for line in open(path):
+        row = json.loads(line)
+        if row.get('skipped'):
+            print(f"{row.get('model', '?'):<28}{row['label']:<16}  SKIPPED: {row.get('reason')}")
+            continue
+        if row.get('scenario') or 'qa_exact_match' not in row:
+            continue
+        answer = next((r.get('raw_answer') or '' for r in row['request_results'] if r.get('ok')), '')
+        print(f"{row['base_model']:<28}{row['label']:<16}{row['qa_exact_match']:>7.2f}"
+              f"{row['length_limited_requests']:>4}/{row['requests']:<4}  {answer[-70:]!r}")
+print("\nLook for: tokenizer encode/decode OK, no 'Ġ'/'Ċ' symbols in answers, and KL to")
+print("vLLM BF16 above 0 for qwen-fp8 / nvidia-nvfp4. One trial at c=1 is not a quality estimate.")
+EOF
+  step "Done. Results: $OUT   Log: $LOG"
+  exit 0
+fi
 
 # ---------------------------------------------------------------- smoke
 if [ "${SKIP_SMOKE:-0}" != "1" ]; then

@@ -11,6 +11,7 @@ dependencies = [
     "pandas>=2.2",
     "matplotlib>=3.9",
     "sacrebleu>=2.5,<3",
+    "tokenizers>=0.20",
 ]
 
 [build-system]

@@ -134,6 +134,7 @@ def main() -> int:
     if args.model not in cfg["models"]:
         ap.error(f"unknown model: {args.model}")
     model_cfg = cfg["models"][args.model]
+    args.likelihood_tokenizer = (model_cfg["shape_from"], model_cfg.get("shape_revision", "main"))
     engine_cfg = model_cfg["engine_rungs"].get(args.engine)
     if not engine_cfg:
         ap.error(f"no {args.engine} variants for {args.model}")
@@ -467,15 +468,20 @@ def run_likelihood(args, base_url, served_model, rung, revision, results_dir, st
             base_url=base_url, engine=args.engine, model=served_model, base_model=args.model,
             label=rung['rung'], model_repo=rung['repo'], model_revision=revision,
             dataset=args.likelihood_dataset, tokens_dir=args.likelihood_tokens_dir,
-            output=output, top_k=args.likelihood_top_k))
+            output=output, top_k=args.likelihood_top_k,
+            tokenizer_repo=args.likelihood_tokenizer[0], tokenizer_revision=args.likelihood_tokenizer[1]))
     except Exception as exc:
         print(f"   likelihood FAILED: {exc}", flush=True)
         _record_skip(out_path, rung, f"likelihood_failed: {exc}")
         return
-    s = record['summary']
-    note = '' if record['tokenizer_matches_frozen_ids'] else ' (server tokenizer differs from frozen IDs)'
+    s, check = record['summary'], record['tokenizer_check']
     print(f"   likelihood: answer PPL {s['answer_ppl']:.3f} over {s['answer_tokens']} tokens "
-          f"in {time.perf_counter() - t0:.0f}s{note}", flush=True)
+          f"in {time.perf_counter() - t0:.0f}s", flush=True)
+    print(f"   tokenizer vs {check['reference']['repo']}: encode {'OK' if check['encode_ok'] else 'MISMATCH'}, "
+          f"decode {'OK' if check['decode_ok'] else 'MISMATCH'} ({check['samples']} samples)", flush=True)
+    for m in check['decode_mismatches'][:2]:
+        print(f"     decode {m['id']}: expected ...{m['expected']!r}\n"
+              f"     {' ' * len(m['id'])}         got      ...{m['got']!r}", flush=True)
 
 
 def _record_skip(out_path: Path, rung: dict, reason: str, b=None, log: str | None = None) -> None:

@@ -36,6 +36,7 @@ llama.cpp smoke-test defaults.
 **One command.** Copy the repository to the Spark and, inside `tmux`, run:
 
 ```bash
+scripts/spark_run.sh vllm-check  # vLLM only: each vLLM row once + tokenizer/likelihood/QA check
 scripts/spark_run.sh smoke   # setup + one quick trial per engine
 scripts/spark_run.sh pilot   # + pilot subset: concurrency 1,4,16, 5 trials (~11 h estimate)
 scripts/spark_run.sh full    # + full study: 50 configurations x 30 trials (re-estimate from pilot)

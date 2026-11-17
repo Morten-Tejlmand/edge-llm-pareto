@@ -1,16 +1,24 @@
 """Teacher-forced answer likelihood on the QA set: perplexity and KL divergence.
 
-Each QA item is scored as the fixed text ``{prompt}\\n\\nAnswer: {reference answer}``.
-The text is tokenized once per model and the same token IDs are sent to every
-engine and artifact, so all of them score exactly the same tokens. For every
-answer token the engine returns the log-probability of the reference token and
-the top-k next-token log-probabilities.
+Each QA item is scored as the fixed text ``{prompt} {reference answer}`` (the QA
+prompts end in ``Answer:``; it is appended when missing).
+The text is tokenized once per model with the publisher's reference tokenizer
+(``tokenizer.json`` of the model's ``shape_from`` repo at ``shape_revision``), and
+the same token IDs are sent to every engine and artifact, so all of them score
+exactly the same tokens regardless of run order. For every answer token the
+engine returns the log-probability of the reference token and the top-k
+next-token log-probabilities.
 
 - vLLM: one /v1/completions request per item with ``prompt_logprobs=k``.
 - llama.cpp: llama-server has no prompt log-probabilities, so each answer position
   is one /completion request with ``n_predict=1`` and ``n_probs=k`` (raw softmax
   with ``temperature=-1``). If the reference token is outside the top k, the
   request is repeated with a larger ``n_probs``.
+
+Every server's own tokenizer is also checked against the reference on sample
+items: encoding (text -> IDs) and decoding (IDs -> text). Scoring does not depend
+on it, but generation and exact-match QA do (see the vLLM decoding bug in
+docs/pilot-findings-vllm.md).
 
 Perplexity is ``exp(mean answer-token NLL)``. KL(reference || candidate) per
 position uses the reference top-k plus one bucket for the remaining mass; a
@@ -28,15 +36,19 @@ import math
 import statistics
 from pathlib import Path
 
-SCHEMA_VERSION = 1
-TEXT_FORMAT = 'prompt_blank_line_answer_colon_v1'
+SCHEMA_VERSION = 2
+TEXT_FORMAT = 'prompt_answer_colon_v2'
 KL_METHOD = 'topk_reference_plus_tail_bucket_v1'
 DEFAULT_TOP_K = 20  # vLLM's default --max-logprobs
 LLAMA_FALLBACK_PROBS = (1000, 200000)
+TOKENIZER_CHECK_SAMPLES = 10
 
 
 def item_texts(task):
-    context = f"{task['prompt'].rstrip()}\n\nAnswer:"
+    """Prompt ending in 'Answer:' (added if missing), then ' ' + first reference answer."""
+    context = task['prompt'].rstrip()
+    if not context.endswith('Answer:'):
+        context += '\n\nAnswer:'
     return context, context + ' ' + task['answers'][0].strip()
 
 
@@ -64,6 +76,47 @@ def sequences_sha(items):
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+class ReferenceTokenizer:
+    """The publisher's tokenizer.json, pinned to one revision (engine-independent)."""
+
+    def __init__(self, repo, revision):
+        from huggingface_hub import hf_hub_download
+        from tokenizers import Tokenizer
+        self.repo, self.revision = repo, revision
+        self.tokenizer = Tokenizer.from_file(hf_hub_download(repo, 'tokenizer.json', revision=revision))
+        try:
+            config = json.loads(Path(hf_hub_download(repo, 'tokenizer_config.json', revision=revision)).read_text())
+        except Exception:
+            config = {}
+        bos = config.get('bos_token')
+        bos = bos.get('content') if isinstance(bos, dict) else bos
+        self.bos_id = self.tokenizer.token_to_id(bos) if bos else None
+        self.add_bos = bool(config.get('add_bos_token')) and self.bos_id is not None
+
+    def encode(self, text):
+        ids = self.tokenizer.encode(text, add_special_tokens=True).ids
+        # transformers adds BOS from tokenizer_config even if tokenizer.json does not.
+        if self.add_bos and (not ids or ids[0] != self.bos_id):
+            ids = [self.bos_id] + ids
+        return ids
+
+    def identity(self):
+        return dict(repo=self.repo, revision=self.revision)
+
+
+def build_sequences(encode, tasks):
+    items, skipped = [], []
+    for task in tasks:
+        context, full = item_texts(task)
+        context_ids, full_ids = encode(context), encode(full)
+        answer_ids = split_answer(context_ids, full_ids)
+        if answer_ids is None:
+            skipped.append(task['id'])
+            continue
+        items.append(dict(id=task['id'], context_ids=context_ids, answer_ids=answer_ids))
+    return items, skipped
+
+
 # ------------------------------------------------------------------ server I/O
 
 def root_url(base_url):
@@ -82,18 +135,35 @@ async def tokenize(client, engine, base_url, model, text):
     return r.json()['tokens']
 
 
-async def build_sequences(client, engine, base_url, model, tasks):
-    items, skipped = [], []
-    for task in tasks:
-        context, full = item_texts(task)
-        context_ids = await tokenize(client, engine, base_url, model, context)
-        full_ids = await tokenize(client, engine, base_url, model, full)
-        answer_ids = split_answer(context_ids, full_ids)
-        if answer_ids is None:
-            skipped.append(task['id'])
-            continue
-        items.append(dict(id=task['id'], context_ids=context_ids, answer_ids=answer_ids))
-    return items, skipped
+async def detokenize(client, engine, base_url, model, ids):
+    if engine == 'llama_cpp':
+        r = await client.post(root_url(base_url) + '/detokenize', json={'tokens': ids})
+        r.raise_for_status()
+        return r.json()['content']
+    r = await client.post(root_url(base_url) + '/detokenize', json={'model': model, 'tokens': ids})
+    r.raise_for_status()
+    return r.json()['prompt']
+
+
+async def check_tokenizer(client, engine, base_url, model, tasks, frozen, samples=TOKENIZER_CHECK_SAMPLES):
+    """Compare the server's encode/decode with the reference IDs on sample items."""
+    by_id = {t['id']: t for t in tasks}
+    bos = frozen.get('bos_id')
+    encode_mismatch, decode_mismatch = [], []
+    for item in frozen['items'][:samples]:
+        context, full = item_texts(by_id[item['id']])
+        if await tokenize(client, engine, base_url, model, context) != item['context_ids']:
+            encode_mismatch.append(item['id'])
+        ids = item['context_ids'] + item['answer_ids']
+        if bos is not None and ids and ids[0] == bos:
+            ids = ids[1:]
+        text = await detokenize(client, engine, base_url, model, ids)
+        if text.strip() != full.strip():
+            decode_mismatch.append(dict(id=item['id'], expected=full[-60:], got=text[-60:]))
+    checked = min(samples, len(frozen['items']))
+    return dict(reference=frozen['tokenizer'], samples=checked,
+                encode_ok=not encode_mismatch, decode_ok=not decode_mismatch,
+                encode_mismatch_ids=encode_mismatch, decode_mismatches=decode_mismatch)
 
 
 def parse_vllm_prompt_logprobs(prompt_logprobs, ids, start, k):
@@ -159,46 +229,50 @@ async def score_items(client, engine, base_url, model, items, k, concurrency=8):
             return dict(id=item['id'], positions=await scorer(client, base_url, model, item, k))
     return await asyncio.gather(*(one(i) for i in items))
 
-
-def load_or_build_tokens(cache_path, built, *, base_model, dataset_sha256, engine):
-    """Reuse the model's frozen token IDs; the first engine to run creates them."""
+def load_or_build_tokens(cache_path, reference, tasks, *, base_model, dataset_sha256):
+    """Reuse the model's frozen token IDs, or build them with the reference tokenizer."""
     cache = Path(cache_path)
     if cache.exists():
         frozen = json.loads(cache.read_text())
-        if frozen['base_model'] != base_model or frozen['dataset_sha256'] != dataset_sha256:
-            raise ValueError(f'{cache} belongs to another model or dataset')
+        if (frozen.get('schema_version') != SCHEMA_VERSION or frozen['base_model'] != base_model
+                or frozen['dataset_sha256'] != dataset_sha256):
+            raise ValueError(f'{cache} belongs to another model, dataset or format; delete it to rebuild')
+        if reference is not None and frozen['tokenizer'] != reference.identity():
+            raise ValueError(f'{cache} was built with another tokenizer revision; delete it to rebuild')
         return frozen
-    items, skipped = built
+    if reference is None:
+        raise ValueError('No frozen token IDs and no reference tokenizer to build them')
+    items, skipped = build_sequences(reference.encode, tasks)
     frozen = dict(schema_version=SCHEMA_VERSION, base_model=base_model,
                   dataset_sha256=dataset_sha256, text_format=TEXT_FORMAT,
-                  tokenized_by_engine=engine, skipped_ids=skipped, items=items,
-                  sequences_sha256=sequences_sha(items))
+                  tokenizer=reference.identity(), bos_id=reference.bos_id if reference.add_bos else None,
+                  skipped_ids=skipped, items=items, sequences_sha256=sequences_sha(items))
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text(json.dumps(frozen))
     return frozen
 
 
 async def evaluate(*, base_url, engine, model, base_model, label, model_repo, model_revision,
-                   dataset, tokens_dir, output, top_k=DEFAULT_TOP_K, concurrency=8, timeout=600,
-                   transport=None):
+                   dataset, tokens_dir, output, tokenizer_repo=None, tokenizer_revision=None,
+                   reference=None, top_k=DEFAULT_TOP_K, concurrency=8, timeout=600, transport=None):
     """Score one running server and write its likelihood record."""
     import httpx
     tasks, dataset_sha = load_tasks(dataset)
+    if reference is None and tokenizer_repo:
+        reference = ReferenceTokenizer(tokenizer_repo, tokenizer_revision)
     cache = Path(tokens_dir) / f'{base_model}-{dataset_sha[:12]}.json'
+    frozen = load_or_build_tokens(cache, reference, tasks, base_model=base_model,
+                                  dataset_sha256=dataset_sha)
     async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
-        built = None if cache.exists() else await build_sequences(client, engine, base_url, model, tasks)
-        frozen = load_or_build_tokens(cache, built, base_model=base_model,
-                                      dataset_sha256=dataset_sha, engine=engine)
-        # Token IDs are sent directly, so the server tokenizer is only checked, not used.
-        probe = frozen['items'][0]
-        context = item_texts(next(t for t in tasks if t['id'] == probe['id']))[0]
-        tokenizer_matches = await tokenize(client, engine, base_url, model, context) == probe['context_ids']
+        # Token IDs are sent directly, so the server tokenizer is checked, not used.
+        check = await check_tokenizer(client, engine, base_url, model, tasks, frozen)
         scored = await score_items(client, engine, base_url, model, frozen['items'], top_k, concurrency)
     record = dict(schema_version=SCHEMA_VERSION, base_model=base_model, engine=engine, label=label,
                   model_repo=model_repo, model_revision=model_revision,
                   dataset_sha256=dataset_sha, text_format=TEXT_FORMAT, top_k=top_k,
                   sequences_sha256=frozen['sequences_sha256'], tokens_file=str(cache),
-                  tokenizer_matches_frozen_ids=tokenizer_matches,
+                  tokenizer_check=check,
+                  tokenizer_matches_frozen_ids=check['encode_ok'] and check['decode_ok'],
                   summary=summarize(scored), items=scored)
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     Path(output).write_text(json.dumps(record))

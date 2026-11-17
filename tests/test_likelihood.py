@@ -21,11 +21,26 @@ spec = importlib.util.spec_from_file_location('likelihood_report', ROOT / 'scrip
 report = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(report)
 CONFIG = yaml.safe_load((ROOT / 'configs/study.yaml').read_text())
-VOCAB = 8
+
+
+CHARS = sorted(set('Passage: x. Question: y?z.w Answer: abc de\n'))
+VOCAB = len(CHARS) + 1  # token 0 is BOS
 
 
 def tokenize_text(text):
-    return [1] + [ord(c) % VOCAB for c in text]  # BOS + one token per character
+    return [0] + [CHARS.index(c) + 1 for c in text]  # BOS + one token per character
+
+
+def detokenize_ids(ids):
+    return ''.join(CHARS[i - 1] for i in ids if i)
+
+
+class FakeReference:
+    bos_id, add_bos = 0, True
+    encode = staticmethod(tokenize_text)
+
+    def identity(self):
+        return dict(repo='publisher/model', revision='abc')
 
 
 def logprobs_after(prefix, sharpness=1.0):
@@ -35,15 +50,16 @@ def logprobs_after(prefix, sharpness=1.0):
     return [x - z for x in logits]
 
 
-def fake_server(engine, sharpness=1.0):
+def fake_server(engine, sharpness=1.0, encode=tokenize_text, decode=detokenize_ids):
     def handler(request):
         body = json.loads(request.content)
         path = request.url.path
         if path == '/tokenize':
             text = body.get('content', body.get('prompt'))
-            ids = tokenize_text(text)
-            return httpx.Response(200, json={'tokens': ids} if engine == 'vllm'
-                                  else {'tokens': ids})
+            return httpx.Response(200, json={'tokens': encode(text)})
+        if path == '/detokenize':
+            text = decode(body['tokens'])
+            return httpx.Response(200, json={'prompt': text} if engine == 'vllm' else {'content': text})
         if engine == 'llama_cpp' and path == '/completion':
             lps = logprobs_after(body['prompt'], sharpness)
             top = sorted(range(VOCAB), key=lambda t: -lps[t])[:body['n_probs']]
@@ -63,7 +79,7 @@ def fake_server(engine, sharpness=1.0):
     return httpx.MockTransport(handler)
 
 
-TASKS = [{'id': 'a', 'prompt': 'Passage: x. Question: y?', 'answers': ['abc']},
+TASKS = [{'id': 'a', 'prompt': 'Passage: x. Question: y? Answer:', 'answers': ['abc']},
          {'id': 'b', 'prompt': 'Passage: z. Question: w?', 'answers': ['de', 'other']}]
 
 
@@ -77,12 +93,12 @@ class LikelihoodTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_engine(self, engine, label, sharpness=1.0, top_k=3):
+    def run_engine(self, engine, label, sharpness=1.0, top_k=3, **server):
         return asyncio.run(lk.evaluate(
             base_url='http://fake/v1', engine=engine, model='m', base_model='qwen3.8-27b',
             label=label, model_repo='repo', model_revision='rev', dataset=self.dataset,
             tokens_dir=self.dir / 'tokens', output=self.dir / f'{engine}-{label}.likelihood.json',
-            top_k=top_k, transport=fake_server(engine, sharpness)))
+            reference=FakeReference(), top_k=top_k, transport=fake_server(engine, sharpness, **server)))
 
     def test_split_answer_requires_prefix(self):
         self.assertEqual(lk.split_answer([1, 2], [1, 2, 3, 4]), [3, 4])
@@ -94,6 +110,7 @@ class LikelihoodTest(unittest.TestCase):
         vllm = self.run_engine('vllm', 'native-bf16')
         self.assertEqual(llama['sequences_sha256'], vllm['sequences_sha256'])
         self.assertEqual(llama['summary']['answer_tokens'], len(' abc') + len(' de'))
+        self.assertTrue(llama['tokenizer_check']['encode_ok'] and vllm['tokenizer_check']['decode_ok'])
         self.assertAlmostEqual(llama['summary']['answer_ppl'], vllm['summary']['answer_ppl'])
         c = lk.compare(llama, vllm)
         self.assertAlmostEqual(c['kl_mean'], 0, places=9)
@@ -103,8 +120,8 @@ class LikelihoodTest(unittest.TestCase):
         ref = self.run_engine('llama_cpp', 'gguf-bf16', top_k=VOCAB)
         cand = self.run_engine('llama_cpp', 'gguf-ud-q4_k_xl', sharpness=1.5, top_k=VOCAB)
         exact = []
-        for item in lk.load_or_build_tokens(Path(ref['tokens_file']), None, base_model='qwen3.8-27b',
-                                            dataset_sha256=ref['dataset_sha256'], engine='x')['items']:
+        for item in lk.load_or_build_tokens(Path(ref['tokens_file']), None, None, base_model='qwen3.8-27b',
+                                            dataset_sha256=ref['dataset_sha256'])['items']:
             ids = item['context_ids'] + item['answer_ids']
             kls = []
             for i in range(len(item['context_ids']), len(ids)):
@@ -125,7 +142,35 @@ class LikelihoodTest(unittest.TestCase):
         self.run_engine('llama_cpp', 'gguf-bf16')
         cache = next((self.dir / 'tokens').glob('*.json'))
         with self.assertRaises(ValueError):
-            lk.load_or_build_tokens(cache, None, base_model='qwen3.8-27b', dataset_sha256='x', engine='vllm')
+            lk.load_or_build_tokens(cache, None, None, base_model='qwen3.8-27b', dataset_sha256='x')
+
+    def test_item_text_does_not_repeat_answer_prefix(self):
+        self.assertEqual(lk.item_texts(TASKS[0])[1], 'Passage: x. Question: y? Answer: abc')
+        self.assertEqual(lk.item_texts(TASKS[1])[1], 'Passage: z. Question: w?\n\nAnswer: de')
+
+    def test_tokenizer_check_flags_broken_server_tokenizers(self):
+        # The pilot's vLLM bug: byte-level symbols leak into decoded text.
+        broken_decode = lambda ids: detokenize_ids(ids).replace(' ', 'Ġ')
+        rec = self.run_engine('vllm', 'native-bf16', decode=broken_decode)
+        self.assertTrue(rec['tokenizer_check']['encode_ok'])
+        self.assertFalse(rec['tokenizer_check']['decode_ok'])
+        self.assertIn('Ġ', rec['tokenizer_check']['decode_mismatches'][0]['got'])
+        no_bos = self.run_engine('llama_cpp', 'gguf-bf16', encode=lambda t: tokenize_text(t)[1:])
+        self.assertFalse(no_bos['tokenizer_check']['encode_ok'])
+        self.assertFalse(no_bos['tokenizer_matches_frozen_ids'])
+        # Scoring uses the frozen IDs, so a broken server tokenizer does not change it.
+        ok = self.run_engine('vllm', 'other')
+        self.assertAlmostEqual(rec['summary']['answer_nll'], ok['summary']['answer_nll'])
+
+    def test_frozen_tokens_reject_other_tokenizer_revision(self):
+        self.run_engine('llama_cpp', 'gguf-bf16')
+        cache = next((self.dir / 'tokens').glob('*.json'))
+        frozen = json.loads(cache.read_text())
+        other = FakeReference()
+        other.identity = lambda: dict(repo='publisher/model', revision='new')
+        with self.assertRaises(ValueError):
+            lk.load_or_build_tokens(cache, other, TASKS, base_model='qwen3.8-27b',
+                                    dataset_sha256=frozen['dataset_sha256'])
 
     def test_compare_rejects_different_sequences(self):
         a = self.run_engine('llama_cpp', 'gguf-bf16')
