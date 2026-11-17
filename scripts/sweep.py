@@ -18,6 +18,7 @@ import math
 import os
 import random
 import platform
+import signal
 from types import SimpleNamespace
 import subprocess
 import sys
@@ -494,5 +495,25 @@ def _record_skip(out_path: Path, rung: dict, reason: str, b=None, log: str | Non
         }) + "\n")
 
 
+def _stop_on_signal(signum, _frame):
+    """Turn SIGTERM/SIGHUP into KeyboardInterrupt so `with h:` stops the server.
+
+    The server runs in its own session (serve.start), so a dropped SSH session
+    or `kill` never reaches it; without this, Python dies without unwinding and
+    leaves vLLM/llama-server holding most of the unified memory.
+    """
+    # Ignore repeats so a second signal cannot interrupt the server shutdown.
+    for s in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, signal.SIG_IGN)
+    try:  # after a hangup the terminal/tee may be gone; never let that block cleanup
+        print(f"\nReceived {signal.Signals(signum).name}; stopping the server and exiting.",
+              file=sys.stderr, flush=True)
+    except OSError:
+        pass
+    raise KeyboardInterrupt
+
+
 if __name__ == "__main__":
+    for _sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(_sig, _stop_on_signal)
     raise SystemExit(main())

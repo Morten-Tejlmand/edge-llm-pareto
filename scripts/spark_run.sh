@@ -47,6 +47,40 @@ command -v nvidia-smi >/dev/null || die "nvidia-smi not found: NVIDIA driver mis
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader || die "nvidia-smi failed."
 command -v uv >/dev/null || die "uv not found. Install it: https://docs.astral.sh/uv/getting-started/installation/"
 
+# Leftover inference servers from an interrupted run hold most of the unified
+# memory, and the next run then fails with "predicted not to fit" or "server
+# slots exceed estimated capacity". Stop our own leftovers; refuse to touch a
+# run that is still in progress or a port held by something else.
+BENCH_PORT="${BENCH_PORT:-8000}"
+# Match the program actually being run (argv[0..2]), not any command line that
+# merely mentions these names (an editor, `tail -f`, a shell).
+own_procs() { ps -u "$(id -u)" -o pid=,args= | awk -v me=$$ "$1"; }
+find_servers() { own_procs '$1 != me && ($2 ~ /(^|\/)llama-server$/ || $2 ~ /^VLLM::/ ||
+  ($2 ~ /(^|\/)vllm$/ && $3 == "serve") || ($3 ~ /(^|\/)vllm$/ && $4 == "serve")) {print $1}'; }
+ACTIVE=$(own_procs '$2 ~ /(^|\/)python[0-9.]*$/ && $3 ~ /scripts\/(sweep|qa_study)\.py$/ {print $1}')
+[ -z "$ACTIVE" ] || die "Another benchmark run is in progress (PIDs: $(echo $ACTIVE)). Check 'tmux ls'; stop it before starting a new one."
+STALE=$(find_servers)
+if [ -n "$STALE" ]; then
+  echo "Stopping leftover inference servers from an earlier run:"
+  ps -o pid=,etime=,args= -p "$(echo $STALE | tr ' ' ,)" | cut -c1-160
+  kill -INT $STALE 2>/dev/null || true
+  for _ in $(seq 30); do
+    STALE=$(find_servers)
+    [ -z "$STALE" ] && break
+    sleep 1
+  done
+  if [ -n "$STALE" ]; then kill -KILL $STALE 2>/dev/null || true; sleep 3; fi
+  STALE=$(find_servers)
+  [ -z "$STALE" ] || die "Could not stop leftover servers (PIDs: $(echo $STALE))."
+  echo "Leftover servers stopped."
+fi
+if command -v ss >/dev/null && ss -ltn "sport = :$BENCH_PORT" | grep -q LISTEN; then
+  die "Port $BENCH_PORT is in use by another process: $(ss -ltnp "sport = :$BENCH_PORT" | tail -n +2). Stop it first."
+fi
+AVAIL_GB=$(awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo)
+echo "Available memory: ${AVAIL_GB} GB"
+[ "$AVAIL_GB" -ge 100 ] || echo "Warning: under 100 GB available; check 'nvidia-smi' for other GPU processes. Servers may be predicted not to fit."
+
 HF_CACHE="${HF_HOME:-$HOME/.cache/huggingface}"
 mkdir -p "$HF_CACHE"
 FREE_GB=$(df -Pk "$HF_CACHE" | awk 'NR==2 {print int($4/1024/1024)}')
