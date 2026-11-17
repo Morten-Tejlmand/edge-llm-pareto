@@ -107,7 +107,11 @@ models:
         revision: eb48357c179d34dbf515983f798dfb8752a0f261
         default_rung: native-bf16
         rungs:
-          - {rung: native-bf16, repo: deepseek-ai/DeepSeek-R1-0528-Qwen3-8B, revision: 6e8885a6ff5c1dc5201574c8fd700323f23c25fa, linear_bits: 16, dtype: bfloat16}
+          # tokenizer_class_override: the repo declares LlamaTokenizerFast for a
+          # Qwen3 byte-level vocabulary; transformers 5.x then drops spaces and
+          # newlines (prompts) and returns raw 'Ġ'/'Ċ' (answers). Same files at the
+          # pinned revision, loaded as published (serve.prepare_tokenizer_override).
+          - {rung: native-bf16, repo: deepseek-ai/DeepSeek-R1-0528-Qwen3-8B, revision: 6e8885a6ff5c1dc5201574c8fd700323f23c25fa, linear_bits: 16, dtype: bfloat16, tokenizer_class_override: PreTrainedTokenizerFast}
           - {rung: gguf-bf16, file: DeepSeek-R1-0528-Qwen3-8B-BF16.gguf, linear_bits: 16, dtype: float16}
           - {rung: gguf-ud-q8_k_xl, file: DeepSeek-R1-0528-Qwen3-8B-UD-Q8_K_XL.gguf, linear_bits: 10.5, dtype: float16}
           - {rung: gguf-ud-q4_k_xl, file: DeepSeek-R1-0528-Qwen3-8B-UD-Q4_K_XL.gguf, linear_bits: 5.0, dtype: float16}
