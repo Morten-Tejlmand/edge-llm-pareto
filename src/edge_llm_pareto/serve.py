@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -140,8 +141,37 @@ def vllm_server_command(model: str, *, revision: str, alias: str,
     if quantization:
         cmd += ["--quantization", quantization]
     if tokenizer:
-        cmd += ["--tokenizer", tokenizer, "--tokenizer-revision", tokenizer_revision or revision]
+        cmd += ["--tokenizer", tokenizer]
+        if not os.path.isdir(tokenizer):  # a local directory has no Hub revision
+            cmd += ["--tokenizer-revision", tokenizer_revision or revision]
     return cmd
+
+
+def prepare_tokenizer_override(repo: str, revision: str, tokenizer_class: str,
+                               root: str | os.PathLike | None = None) -> str:
+    """Local copy of a repo's tokenizer with only `tokenizer_class` replaced.
+
+    DeepSeek-R1-0528-Qwen3-8B declares `LlamaTokenizerFast`, but its vocabulary
+    is Qwen3 byte-level BPE. transformers 5.x builds that class with a
+    SentencePiece-style pre-tokenizer/decoder that overrides tokenizer.json, so
+    vLLM drops spaces/newlines when encoding prompts and returns raw 'Ġ'/'Ċ'
+    symbols when decoding. `PreTrainedTokenizerFast` loads tokenizer.json as
+    published. Vocabulary, merges, special tokens and chat template are the
+    repo's own files at the pinned revision; only the loader class changes.
+    """
+    from huggingface_hub import hf_hub_download
+
+    root = pathlib.Path(root or pathlib.Path.home() / ".cache" / "edge-llm-pareto" / "tokenizers")
+    out = root / f"{repo.replace('/', '--')}-{revision[:12]}-{tokenizer_class}"
+    out.mkdir(parents=True, exist_ok=True)
+    # config.json too: vLLM also parses the model config from the tokenizer path.
+    for name in ("tokenizer.json", "config.json"):
+        shutil.copyfile(hf_hub_download(repo, name, revision=revision), out / name)
+    config = json.loads(pathlib.Path(
+        hf_hub_download(repo, "tokenizer_config.json", revision=revision)).read_text())
+    config["tokenizer_class"] = tokenizer_class
+    (out / "tokenizer_config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2))
+    return str(out)
 
 
 def executable_version(executable: str) -> str:

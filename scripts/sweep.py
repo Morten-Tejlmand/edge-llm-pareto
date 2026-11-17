@@ -311,6 +311,10 @@ def main() -> int:
             tokenizer_revision = (serve.resolve_hf_revision(
                                       tokenizer_repo, model_cfg.get("shape_revision", "main"))
                                   if args.engine == "vllm" and gguf else None)
+            tokenizer_override = r.get("tokenizer_class_override") if args.engine == "vllm" else None
+            tokenizer_dir = (serve.prepare_tokenizer_override(
+                                 r["repo"], resolved_revision, tokenizer_override)
+                             if tokenizer_override and not gguf else None)
         except Exception as exc:
             print(f"   SKIP: Model resolution failed: {exc}", flush=True)
             _record_skip(out_path, r, f"{'gguf_download_failed' if r.get('file') else 'model_resolution_failed'}: {exc}")
@@ -358,7 +362,7 @@ def main() -> int:
                 kv_cache_memory_bytes=b.kv_mib * 1024 * 1024,
                 dtype=r.get("dtype", "bfloat16"),
                 quantization="gguf" if gguf else r.get("quantization"),
-                tokenizer=tokenizer_repo if gguf else None,
+                tokenizer=tokenizer_repo if gguf else tokenizer_dir,
                 tokenizer_revision=tokenizer_revision,
             )
         log_path = str(results_dir / f"serve-{args.model}-{args.engine}-{r['rung']}-{stamp}.log")
@@ -387,8 +391,15 @@ def main() -> int:
                 continue
             print(f"   ready in {time.perf_counter() - t0:.0f}s")
             if args.likelihood_dataset:
-                run_likelihood(args, h.base_url, served_model, r, resolved_revision,
-                               results_dir, stamp, out_path)
+                check = run_likelihood(args, h.base_url, served_model, r, resolved_revision,
+                                       results_dir, stamp, out_path)
+                # A server tokenizer that disagrees with the reference corrupts
+                # prompts and answers (quality, output lengths, J/token): stop
+                # this variant instead of collecting invalid trials.
+                if check is not None and not (check['encode_ok'] and check['decode_ok']):
+                    print("   SKIP: server tokenizer does not match the reference tokenizer\n", flush=True)
+                    _record_skip(out_path, r, "tokenizer_mismatch", b, log=log_path)
+                    continue
             if args.quality_dataset:
                 from edge_llm_pareto.quality import evaluate
                 quality_path = results_dir / f"{args.model}-{args.engine}-{r['rung']}-{stamp}.quality.json"
@@ -429,6 +440,7 @@ def main() -> int:
                           "dtype": r.get("dtype", "bfloat16") if args.engine == "vllm" else "float16",
                           "tokenizer_repo": tokenizer_repo if args.engine == "vllm" and gguf else None,
                           "tokenizer_revision": tokenizer_revision,
+                          "tokenizer_class_override": tokenizer_override,
                           "server_parallel": parallel,
                           "gpu_memory_utilization": args.gpu_mem_util if args.engine == "vllm" else None,
                           "memory_policy": "explicit_kv_bytes" if args.engine == "vllm" else "estimated_slots",
@@ -448,7 +460,10 @@ def main() -> int:
 
 
 def run_likelihood(args, base_url, served_model, rung, revision, results_dir, stamp, out_path):
-    """Score answer likelihood once per artifact; a failure is recorded, not fatal."""
+    """Score answer likelihood once per artifact; a failure is recorded, not fatal.
+
+    Returns the server tokenizer check, or None if scoring failed.
+    """
     import hashlib
     from edge_llm_pareto import likelihood
     dataset_sha = hashlib.sha256(Path(args.likelihood_dataset).read_bytes()).hexdigest()
@@ -457,10 +472,13 @@ def run_likelihood(args, base_url, served_model, rung, revision, results_dir, st
             old = json.loads(done.read_text())
         except ValueError:
             continue
+        check = old.get('tokenizer_check') or {}
+        # Never reuse a record whose tokenizer check failed: rescore with the
+        # current server so a fixed tokenizer is actually verified.
         if (old.get('model_revision'), old.get('dataset_sha256'), old.get('top_k')) == (
-                revision, dataset_sha, args.likelihood_top_k):
+                revision, dataset_sha, args.likelihood_top_k) and check.get('encode_ok') and check.get('decode_ok'):
             print(f"   likelihood: reusing {done}", flush=True)
-            return
+            return check
     output = results_dir / f"{args.model}-{args.engine}-{rung['rung']}-{stamp}.likelihood.json"
     print(f"   likelihood: scoring answer tokens -> {output}", flush=True)
     t0 = time.perf_counter()
@@ -474,7 +492,7 @@ def run_likelihood(args, base_url, served_model, rung, revision, results_dir, st
     except Exception as exc:
         print(f"   likelihood FAILED: {exc}", flush=True)
         _record_skip(out_path, rung, f"likelihood_failed: {exc}")
-        return
+        return None
     s, check = record['summary'], record['tokenizer_check']
     print(f"   likelihood: answer PPL {s['answer_ppl']:.3f} over {s['answer_tokens']} tokens "
           f"in {time.perf_counter() - t0:.0f}s", flush=True)
@@ -483,6 +501,7 @@ def run_likelihood(args, base_url, served_model, rung, revision, results_dir, st
     for m in check['decode_mismatches'][:2]:
         print(f"     decode {m['id']}: expected ...{m['expected']!r}\n"
               f"     {' ' * len(m['id'])}         got      ...{m['got']!r}", flush=True)
+    return check
 
 
 def _record_skip(out_path: Path, rung: dict, reason: str, b=None, log: str | None = None) -> None:

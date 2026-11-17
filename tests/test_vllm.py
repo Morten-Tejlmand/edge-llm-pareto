@@ -138,3 +138,37 @@ class VllmTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(download.call_args.args[2], 'gguf-sha')
         resolve.assert_called_once_with('unsloth/Qwen3-4B-Instruct-2507', 'shape-sha')
+
+
+class TokenizerOverrideTests(unittest.TestCase):
+    def test_override_copies_files_and_replaces_only_class(self):
+        import json
+        from unittest import mock
+        from edge_llm_pareto import serve
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / 'src'; src.mkdir()
+            (src / 'tokenizer.json').write_text('{"model": {"type": "BPE"}}')
+            (src / 'config.json').write_text('{"model_type": "qwen3"}')
+            (src / 'tokenizer_config.json').write_text(json.dumps(
+                {'tokenizer_class': 'LlamaTokenizerFast', 'chat_template': 'T', 'bos_token': 'B'}))
+            fetch = mock.Mock(side_effect=lambda repo, name, revision: str(src / name))
+            with mock.patch('huggingface_hub.hf_hub_download', fetch):
+                out = serve.prepare_tokenizer_override('org/model', 'abcdef1234567890',
+                                                      'PreTrainedTokenizerFast', root=Path(d) / 'out')
+            cfg = json.loads((Path(out) / 'tokenizer_config.json').read_text())
+            self.assertEqual(cfg, {'tokenizer_class': 'PreTrainedTokenizerFast', 'chat_template': 'T', 'bos_token': 'B'})
+            self.assertEqual((Path(out) / 'tokenizer.json').read_text(), '{"model": {"type": "BPE"}}')
+            self.assertEqual((Path(out) / 'config.json').read_text(), '{"model_type": "qwen3"}')
+            self.assertIn('abcdef123456', out)
+            fetch.assert_any_call('org/model', 'tokenizer.json', revision='abcdef1234567890')
+            # A local tokenizer directory is passed without a Hub revision.
+            cmd = serve.vllm_server_command('org/model', revision='abcdef1234567890', alias='a', tokenizer=out)
+            self.assertEqual(cmd[cmd.index('--tokenizer') + 1], out)
+            self.assertNotIn('--tokenizer-revision', cmd)
+
+    def test_study_config_overrides_deepseek_native_tokenizer(self):
+        import yaml
+        cfg = yaml.safe_load((Path(__file__).resolve().parents[1] / 'configs' / 'study.yaml').read_text())
+        rungs = cfg['models']['deepseek-r1-0528-qwen3-8b']['engine_rungs']['vllm']['rungs']
+        native = next(r for r in rungs if r['rung'] == 'native-bf16')
+        self.assertEqual(native['tokenizer_class_override'], 'PreTrainedTokenizerFast')
