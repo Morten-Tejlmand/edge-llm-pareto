@@ -4,6 +4,7 @@ import random
 import statistics
 from collections import defaultdict
 from .bench import stable_id
+from .spbm import SCOPES as SPBM_SCOPES
 
 METRICS = ('output_tok_s', 'latency_s_p95', 'ttft_s_p95', 'joules_per_output_token', 'run_energy_j')
 
@@ -19,6 +20,26 @@ def comparison_key(row, combine_models=False):
         measurement_protocol=row.get('measurement_protocol'),
         code=row.get('code_fingerprint'), memory_budget=row.get('memory_budget'),
         requests_per_agent=protocol.get('requests_per_agent'), warmup=protocol.get('warmup_requests')))
+
+
+def with_energy_scope(row, scope):
+    """Re-point the energy fields at one spbm scope so the frontier ranks by it.
+
+    Rows without that scope lose their energy and drop out as ineligible, never
+    silently falling back to NVML.
+    """
+    if scope == 'nvml':
+        return row
+    label = SPBM_SCOPES[scope]
+    energy = row.get(f'{scope}_energy_j')
+    out = dict(row, run_energy_j=energy, energy_valid=energy is not None,
+               joules_per_output_token=row.get(f'joules_per_output_token_{scope}'),
+               energy_scope=f'spbm:{label}', energy_source='spbm')
+    for name in ('system_baseline', 'server_idle'):
+        out[f'{name}_adjusted_energy_j'] = row.get(f'{name}_adjusted_{scope}_energy_j')
+        out[f'{name}_adjusted_joules_per_output_token'] = row.get(
+            f'{name}_adjusted_joules_per_output_token_{scope}')
+    return out
 
 
 def interval(values):
@@ -83,7 +104,7 @@ def aggregate(rows, combine_models=False):
     output = []
     for (group, config), trials in groups.items():
         first = trials[0]
-        r = {k: first.get(k) for k in ('label', 'concurrency', 'engine', 'base_model', 'power_setting', 'quality', 'perplexity_evaluation', 'server_parallel')}
+        r = {k: first.get(k) for k in ('label', 'concurrency', 'engine', 'base_model', 'power_setting', 'quality', 'perplexity_evaluation', 'likelihood', 'server_parallel')}
         r.update(comparison_group=group, config_id=config, trials=len(trials))
         if any((t.get('quality') or {}).get('evaluation_mode') == 'measured_qa' for t in trials):
             r['quality'] = measured_quality_summary(trials)
@@ -96,7 +117,10 @@ def aggregate(rows, combine_models=False):
         for metric in ('user_output_tok_s_mean', 'user_output_tok_s_p50', 'user_output_tok_s_p05',
                        'system_baseline_adjusted_energy_j', 'system_baseline_adjusted_joules_per_output_token',
                        'server_idle_adjusted_energy_j', 'server_idle_adjusted_joules_per_output_token',
-                       'qa_score', 'qa_exact_match', 'qa_bleu', 'qa_incomplete_reasoning'):
+                       'qa_score', 'qa_exact_match', 'qa_bleu', 'qa_incomplete_reasoning',
+                       *(f'{p}joules_per_output_token_{scope}' for scope in SPBM_SCOPES
+                         for p in ('', 'system_baseline_adjusted_', 'server_idle_adjusted_')),
+                       *(f'{scope}_energy_j' for scope in SPBM_SCOPES)):
             values = [t[metric] for t in trials if isinstance(t.get(metric), (int, float)) and math.isfinite(t[metric])]
             r[metric + '_samples'] = len(values)
             if values:
@@ -108,14 +132,53 @@ def aggregate(rows, combine_models=False):
     return output
 
 
+LIKELIHOOD_FIELDS = ('answer_ppl', 'answer_nll', 'answer_tokens',
+                     'kl_to_engine_bf16', 'kl_to_engine_bf16_ci_low', 'kl_to_engine_bf16_ci_high',
+                     'top1_agreement_engine_bf16', 'kl_to_llama_cpp_bf16',
+                     'top1_agreement_llama_cpp_bf16')
+
+
+def attach_likelihood(rows, bundle):
+    """Add QA answer perplexity/KL (likelihood_report.py) to rows of the same artifact."""
+    index = {}
+    for rec in bundle['rows']:
+        key = (rec['base_model'], rec['engine'], rec['label'])
+        if key in index:
+            raise ValueError(f'Duplicate likelihood record for {key}')
+        index[key] = rec
+    out = []
+    for row in rows:
+        rec = index.get((row.get('base_model'), row.get('engine'), row.get('label')))
+        if rec and row.get('model_revision') not in (None, rec['model_revision']):
+            raise ValueError(f"Likelihood revision differs from benchmark revision for {row.get('label')}")
+        out.append(dict(row, likelihood={k: rec.get(k) for k in LIKELIHOOD_FIELDS} if rec else None))
+    return out
+
+
+# Energy per output token is always minimized; these name the other axes.
+OBJECTIVES = {
+    'output_tok_s': ('output_tok_s',),
+    'latency_s_p95': ('latency_s_p95',),
+    'ttft_s_p95': ('ttft_s_p95',),
+    # Three-way frontier: J/token, throughput and TTFT together.
+    'throughput_ttft': ('output_tok_s', 'ttft_s_p95'),
+}
+MAXIMIZE = {'output_tok_s'}
+AXIS_LABELS = {'output_tok_s': 'Output tokens/s', 'latency_s_p95': 'p95 request latency (s)',
+               'ttft_s_p95': 'p95 time to first token (s)'}
+
+
 def frontier(rows, objective='output_tok_s'):
-    sign = -1 if objective == 'output_tok_s' else 1
+    """Configurations no other row in their comparison group beats on every axis."""
+    if objective not in OBJECTIVES:
+        raise ValueError(f'unknown objective {objective!r}; choose from {sorted(OBJECTIVES)}')
+    axes = [('joules_per_output_token', 1)] + [(m, -1 if m in MAXIMIZE else 1) for m in OBJECTIVES[objective]]
+
+    def dominates(o, r):
+        pairs = [(sign * o[m], sign * r[m]) for m, sign in axes]
+        return all(a <= b for a, b in pairs) and any(a < b for a, b in pairs)
     return [r for r in rows if not any(
-        o['comparison_group'] == r['comparison_group'] and
-        o['joules_per_output_token'] <= r['joules_per_output_token'] and
-        sign * o[objective] <= sign * r[objective] and
-        (o['joules_per_output_token'] < r['joules_per_output_token'] or sign * o[objective] < sign * r[objective])
-        for o in rows)]
+        o['comparison_group'] == r['comparison_group'] and dominates(o, r) for o in rows)]
 
 
 def export(rows, directory, objective='output_tok_s', baseline=None, min_quality=None,
@@ -160,6 +223,8 @@ def export(rows, directory, objective='output_tok_s', baseline=None, min_quality
         if r.get('perplexity_evaluation'):
             r.update({k: r['perplexity_evaluation'][k] for k in
                       ('perplexity', 'reference_perplexity', 'perplexity_increase_pct')})
+        for k, v in (r.pop('likelihood', None) or {}).items():
+            r['qa_' + k] = v
     if min_quality is not None:
         if not 0 <= min_quality <= 1:
             raise ValueError('min-quality must be between 0 and 1')
@@ -185,19 +250,30 @@ def export(rows, directory, objective='output_tok_s', baseline=None, min_quality
         writer = csv.DictWriter(f, fields)
         writer.writeheader()
         writer.writerows(data)
+    scopes = {comparison_key(r, combine_models): r.get('energy_scope') for r in rows}
     for group in sorted({r['comparison_group'] for r in data}):
         points = [r for r in data if r['comparison_group'] == group]
         fig, ax = plt.subplots()
+        x_metric = OBJECTIVES[objective][0]
+        color_metric = OBJECTIVES[objective][1] if len(OBJECTIVES[objective]) > 1 else None
+        if color_metric:
+            values = [r[color_metric] for r in points]
+            norm = matplotlib.colors.Normalize(min(values), max(values))
+            cmap = plt.get_cmap('viridis')
         for r in points:
-            x, y = r[objective], r['joules_per_output_token']
-            low, high = r[objective + '_ci_low'], r[objective + '_ci_high']
+            x, y = r[x_metric], r['joules_per_output_token']
+            low, high = r[x_metric + '_ci_low'], r[x_metric + '_ci_high']
             yl, yh = r['joules_per_output_token_ci_low'], r['joules_per_output_token_ci_high']
             ax.errorbar(x, y, xerr=None if low is None else [[max(0, x-low)], [max(0, high-x)]],
                         yerr=None if yl is None else [[max(0, y-yl)], [max(0, yh-y)]],
-                        fmt='*' if r['pareto'] else 'o')
+                        fmt='*' if r['pareto'] else 'o',
+                        color=cmap(norm(r[color_metric])) if color_metric else None)
             ax.annotate(f"{r['base_model']} {r['label']} c={r['concurrency']} {r['power_setting']}", (x, y), fontsize=7)
-        ax.set_xlabel('Output tokens/s' if objective == 'output_tok_s' else 'p95 request latency (s)')
-        ax.set_ylabel('J/output token (including prompt processing)')
+        if color_metric:
+            fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax,
+                         label=AXIS_LABELS[color_metric])
+        ax.set_xlabel(AXIS_LABELS[x_metric])
+        ax.set_ylabel(f"J/output token, {scopes.get(group, 'unknown scope')} (including prompt processing)")
         fig.tight_layout()
         fig.savefig(dest / f'{group}-{objective}.png', dpi=180)
         fig.savefig(dest / f'{group}-{objective}.pdf')

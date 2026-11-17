@@ -338,7 +338,8 @@ def probe_power_state(index: int = 0) -> PowerState:
 
 
 def check_benchmark_conditions(
-    ps: PowerState, min_clock_fraction: float = 0.5, intentional_power_limit: bool = False
+    ps: PowerState, min_clock_fraction: float = 0.5, intentional_power_limit: bool = False,
+    idle_power_w: float = 15,
 ) -> list[str]:
     """Reasons the machine is unfit to produce comparable timings."""
     problems = []
@@ -347,12 +348,18 @@ def check_benchmark_conditions(
             "running on battery -- the GPU is power-capped and timings are meaningless"
         )
     throttles = ps.throttle_reasons
-    if any("Slowdown" in r or ("Power Cap" in r and not intentional_power_limit) for r in throttles):
+    # A power cap only limits a GPU that is drawing power. The GB10 can report
+    # "SW Power Cap" while idle (~5 W, idle clocks), which is not throttling;
+    # ignore it there. Thermal/hardware slowdowns always count, and per-sample
+    # throttle reasons and clocks are still recorded during every trial.
+    idle = ps.power_w is not None and ps.power_w < idle_power_w
+    if any("Slowdown" in r or ("Power Cap" in r and not intentional_power_limit and not idle)
+           for r in throttles):
         problems.append(f"GPU throttled: {', '.join(throttles)}")
     frac = ps.clock_fraction
     # Only meaningful under load; at idle a low clock is correct. The sweep
     # records sampled clocks during the run for later inspection.
-    if not intentional_power_limit and frac is not None and frac < min_clock_fraction and (ps.power_w or 0) > 15:
+    if not intentional_power_limit and frac is not None and frac < min_clock_fraction and (ps.power_w or 0) > idle_power_w:
         problems.append(
             f"SM clock at {ps.sm_clock_mhz}/{ps.sm_clock_max_mhz} MHz "
             f"({frac:.0%} of peak) under load"

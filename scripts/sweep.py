@@ -80,6 +80,8 @@ def main() -> int:
     ap.add_argument("--requests-per-agent", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--warmup-requests", type=int, default=0)
+    ap.add_argument("--warmup-trials", type=int, default=0,
+                    help="full trials run and discarded after each server start, before the first measured trial")
     ap.add_argument("--gsmm", action="store_true", help="collect 30 s system-baseline and per-trial server-idle windows unless overridden")
     ap.add_argument("--baseline-seconds", type=float, default=None, help="system baseline per variant before launch; 0 disables")
     ap.add_argument("--idle-seconds", type=float, default=None, help="server idle after warmup before each trial; 0 disables")
@@ -99,6 +101,11 @@ def main() -> int:
     ap.add_argument('--quality-max-tokens', type=int, default=None, help='independent QA output cap; default uncapped within context')
     ap.add_argument('--quality-scorer', choices=['exact-match', 'bleu'], default='exact-match')
     ap.add_argument("--quality-results", help="JSON produced by evaluate.py for these exact variants")
+    ap.add_argument("--likelihood-dataset", help="QA JSONL: score teacher-forced answer log-probabilities "
+                    "(perplexity, KL inputs) on each launched variant before benchmarking")
+    ap.add_argument("--likelihood-top-k", type=int, default=20, help="top-k log-probabilities per answer token")
+    ap.add_argument("--likelihood-tokens-dir", default=str(ROOT / "data/likelihood-tokens"),
+                    help="frozen per-model token IDs shared by every engine and artifact")
     add_memory_arguments(ap)
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--results-dir", default=str(ROOT / "results"))
@@ -119,8 +126,8 @@ def main() -> int:
         ap.error("measured QA uses --output-tokens; --quality-max-tokens is for separate QA evaluation")
     if args.quality_dataset and args.quality_results:
         ap.error("choose --quality-dataset or --quality-results")
-    if args.repeats < 1 or args.warmup_requests < 0:
-        ap.error("repeats must be positive and warmup requests nonnegative")
+    if args.repeats < 1 or args.warmup_requests < 0 or args.warmup_trials < 0:
+        ap.error("repeats must be positive and warmup requests/trials nonnegative")
     if args.target == "jetson" and not all(any(arg == flag or arg.startswith(flag + "=") for arg in sys.argv) for flag in ("--host-reserve-gib", "--runtime-overhead-gib")):
         ap.error("Jetson requires explicit --host-reserve-gib and --runtime-overhead-gib calibrated for your device")
     cfg = yaml.safe_load(Path(args.config).read_text())
@@ -151,6 +158,8 @@ def main() -> int:
             raise ValueError("concurrency levels must be positive")
         if cfg["defaults"]["kv_dtype_bytes"] != 2:
             raise ValueError("Both backends use 16-bit KV; kv_dtype_bytes must be 2")
+        if args.likelihood_top_k < 1:
+            raise ValueError("likelihood-top-k must be positive")
         if args.quality_max_tokens is not None and args.quality_max_tokens <= 0:
             raise ValueError("quality-max-tokens must be positive")
         if min(args.context, args.prompt_tokens, args.output_tokens,
@@ -245,6 +254,7 @@ def main() -> int:
     measurement_protocol = dict(baseline_seconds=args.baseline_seconds,
         idle_seconds=args.idle_seconds, telemetry_interval_s=args.sample_interval,
         baseline_frequency='before_each_variant_launch', idle_frequency='after_warmup_before_each_trial',
+        warmup_trials=args.warmup_trials, warmup_trial_frequency='after_each_server_start',
         energy_basis='gross', framework='GSMM-informed',
         reference_doi='10.1016/j.future.2024.01.033')
     reference_path = None
@@ -337,7 +347,10 @@ def main() -> int:
             # dedicated-VRAM counters. Runtime overhead remains an estimate.
             cmd = serve.vllm_server_command(
                 gguf["path"] if gguf else r["repo"], executable=args.vllm,
-                revision=resolved_revision, alias=served_model,
+                # A local GGUF has no Hub revision; vLLM uses --revision to fetch the
+                # base model's config from the tokenizer repo, so pin that repo's
+                # commit. The GGUF commit stays in the results as model_revision.
+                revision=tokenizer_revision if gguf else resolved_revision, alias=served_model,
                 ctx_size=args.context, parallel=parallel, port=args.port,
                 gpu_memory_utilization=args.gpu_mem_util,
                 kv_cache_memory_bytes=b.kv_mib * 1024 * 1024,
@@ -371,6 +384,9 @@ def main() -> int:
                 _record_skip(out_path, r, "server_not_ready", b, log=log_path)
                 continue
             print(f"   ready in {time.perf_counter() - t0:.0f}s")
+            if args.likelihood_dataset:
+                run_likelihood(args, h.base_url, served_model, r, resolved_revision,
+                               results_dir, stamp, out_path)
             if args.quality_dataset:
                 from edge_llm_pareto.quality import evaluate
                 quality_path = results_dir / f"{args.model}-{args.engine}-{r['rung']}-{stamp}.quality.json"
@@ -390,7 +406,7 @@ def main() -> int:
                 seed=args.seed, resume=bool(args.resume), workloads=workloads,
                 idle_seconds=args.idle_seconds, telemetry_interval=args.sample_interval,
                 system_baseline=system_baseline, reference_path=reference_path,
-
+                warmup_trials=args.warmup_trials,
                 metadata={"device_id": platform.node(), "code_revision": code_revision, "code_fingerprint": code_fingerprint,
                           "environment_id": environment_id, "environment": environment,
                           "session_observations": session_observations,
@@ -427,6 +443,39 @@ def main() -> int:
         print("No successful benchmark points; check the server log and result errors.")
         return 1
     return 0
+
+
+def run_likelihood(args, base_url, served_model, rung, revision, results_dir, stamp, out_path):
+    """Score answer likelihood once per artifact; a failure is recorded, not fatal."""
+    import hashlib
+    from edge_llm_pareto import likelihood
+    dataset_sha = hashlib.sha256(Path(args.likelihood_dataset).read_bytes()).hexdigest()
+    for done in results_dir.glob(f"{args.model}-{args.engine}-{rung['rung']}-*.likelihood.json"):
+        try:
+            old = json.loads(done.read_text())
+        except ValueError:
+            continue
+        if (old.get('model_revision'), old.get('dataset_sha256'), old.get('top_k')) == (
+                revision, dataset_sha, args.likelihood_top_k):
+            print(f"   likelihood: reusing {done}", flush=True)
+            return
+    output = results_dir / f"{args.model}-{args.engine}-{rung['rung']}-{stamp}.likelihood.json"
+    print(f"   likelihood: scoring answer tokens -> {output}", flush=True)
+    t0 = time.perf_counter()
+    try:
+        record = asyncio.run(likelihood.evaluate(
+            base_url=base_url, engine=args.engine, model=served_model, base_model=args.model,
+            label=rung['rung'], model_repo=rung['repo'], model_revision=revision,
+            dataset=args.likelihood_dataset, tokens_dir=args.likelihood_tokens_dir,
+            output=output, top_k=args.likelihood_top_k))
+    except Exception as exc:
+        print(f"   likelihood FAILED: {exc}", flush=True)
+        _record_skip(out_path, rung, f"likelihood_failed: {exc}")
+        return
+    s = record['summary']
+    note = '' if record['tokenizer_matches_frozen_ids'] else ' (server tokenizer differs from frozen IDs)'
+    print(f"   likelihood: answer PPL {s['answer_ppl']:.3f} over {s['answer_tokens']} tokens "
+          f"in {time.perf_counter() - t0:.0f}s{note}", flush=True)
 
 
 def _record_skip(out_path: Path, rung: dict, reason: str, b=None, log: str | None = None) -> None:

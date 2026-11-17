@@ -6,12 +6,13 @@ throughput, streaming speed and latency as concurrent requests increase.
 
 ## Revised study and vLLM
 
-The [updated experiment plan](docs/study-plan.md) targets **two models × three
-weight representations × two engines × five concurrency levels × 30 trials**:
-60 configurations and 1,800 measured trials, with a light per-trial workload
-estimated at about 4 days on one GB10. Native vLLM rows (publisher BF16,
-Unsloth NVFP4) are optional extras. It covers current Qwen/DeepSeek
-candidates, Unsloth versus official quantization, variability and OpenAI speed tiers.
+The [updated experiment plan](docs/study-plan.md) runs **llama.cpp on Unsloth
+GGUF files and vLLM on official safetensors**, at five concurrency levels × 30
+trials: 50 configurations and 1,500 measured trials (llama.cpp: 2 models × 3
+GGUF representations; vLLM: Qwen BF16 / Qwen FP8 / NVIDIA NVFP4 and DeepSeek
+BF16). The engines therefore run different weight files except at BF16; every
+point is an engine-plus-artifact deployment, and the paper must say so
+([why](docs/pilot-findings-vllm.md#decision-2026-11-17)).
 
 The plan also adopts [Guldner et al.'s GSMM (2024)](https://doi.org/10.1016/j.future.2024.01.033)
 as its measurement reference framework, with a [study-specific mapping](docs/study-plan.md#measurement-methodology-gsmm)
@@ -27,7 +28,7 @@ The sweep now accepts `--engine vllm` with a separately provisioned
 [GB10 vLLM runtime](docs/engines.md#vllm). `configs/study.yaml` supplies Qwen3.8-27B
 and an explicitly older DeepSeek 8B pilot fallback: the latest DeepSeek V4.1
 high-precision reference cannot fit on one Spark. Native vLLM and experimental
-same-GGUF engine comparisons are separate groups; `scripts/qa_study.py` runs both. The commands below retain the original
+GGUF rows on vLLM stay configured only to reproduce the pilot; `scripts/qa_study.py` runs the study matrix. The commands below retain the original
 llama.cpp smoke-test defaults.
 
 ## Run on the Spark
@@ -37,14 +38,16 @@ llama.cpp smoke-test defaults.
 ```bash
 scripts/spark_run.sh smoke   # setup + one quick trial per engine
 scripts/spark_run.sh pilot   # + pilot subset: concurrency 1,4,16, 5 trials (~11 h estimate)
-scripts/spark_run.sh full    # + full study: 60 configurations x 30 trials (~4 days estimate)
+scripts/spark_run.sh full    # + full study: 50 configurations x 30 trials (re-estimate from pilot)
 ```
 
 It runs `uv sync`, builds a CUDA `llama-server` if needed, checks the GPU,
-downloads the pinned Unsloth GGUFs, runs a smoke test and then the chosen study,
-and writes a report. Set `VLLM=/path/to/vllm` to include vLLM (provisioned
-separately, see [engines](docs/engines.md#vllm)); without it only llama.cpp runs.
-Logs go to `results/runs/`.
+downloads the pinned Unsloth GGUFs (vLLM fetches its pinned safetensors itself), runs a smoke test and then the chosen study,
+and writes a report. vLLM is found automatically (`$VLLM`, `PATH`, `~/vllm-env`,
+other `~/*/bin`); it is provisioned separately, see [engines](docs/engines.md#vllm).
+Without it only llama.cpp runs. Results go to `results/pilot/` or `results/full/`;
+re-running the same command after an interruption continues there and skips
+completed trials. Logs go to `results/runs/`.
 
 ### Manual steps
 
@@ -86,7 +89,7 @@ and use OS-reported physical memory, which can be smaller than nominal capacity.
 The sweep refuses a different GPU to avoid accidentally collecting laptop data.
 
 Performance requests default to a **256-output-token cap**, configurable with
-`--output-tokens`. QA is uncapped by default within the configured context;
+`--output-tokens`; the study (`configs/study.yaml`) uses 2048. QA is uncapped by default within the configured context;
 `--quality-max-tokens` sets its independent limit (`--max-tokens` for standalone
 `evaluate.py`). Both paths retain actual output counts and termination reasons.
 Context boundaries and existing request timeouts still apply.
@@ -97,7 +100,7 @@ Context boundaries and existing request timeouts still apply.
 - **16 GiB additional host headroom** below current `MemAvailable`.
 - **4 GiB estimated runtime overhead**, subtracted before estimating KV capacity.
 - **4096 tokens per context**, default concurrency **1**, **one request**.
-- Full sweep levels with `--concurrency all`: **1, 2, 4, 8, 16, 32**.
+- Full sweep levels with `--concurrency all`: **1, 2, 4, 8, 16**.
 
 The tighter of the utilization cap and available-memory-minus-headroom determines
 the budget. Available memory is refreshed before each model launch. GB10 uses

@@ -53,8 +53,19 @@ class PowerMonitor:
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.nvml = None
+        self.spbm = None
 
     def __enter__(self):
+        if not is_jetson():
+            # The Spark's spbm hwmon device is read alongside NVML, never instead
+            # of it, so the NVML fields stay comparable with earlier data.
+            try:
+                from .spbm import Spbm, find_device
+                device = find_device()
+                if device is not None:
+                    self.spbm = Spbm(device)
+            except Exception as exc:
+                self.errors.append(f"spbm: {exc}")
         try:
             if is_jetson():
                 self.rail = find_input_rail()
@@ -122,10 +133,25 @@ class PowerMonitor:
                             row['mem_used_mib'] = n.nvmlDeviceGetMemoryInfo(h).used // 1024**2
                     except Exception as exc:
                         self.errors.append(f"memory: {exc}")
+                if self.spbm:
+                    self._sample_spbm(row)
                 row['t'] = time.perf_counter()
             except Exception as exc:
                 self.errors.append(str(exc))
             self.samples.append(row)
+
+    def _sample_spbm(self, row):
+        began = time.perf_counter()
+        for key, read in (('spbm_power_w', lambda: self.spbm.read('power')),
+                          ('spbm_energy_j', lambda: self.spbm.read('energy')),
+                          ('spbm_temp_c', lambda: self.spbm.read('temp')),
+                          ('spbm_limit_w', self.spbm.read_limit_inputs)):
+            try:
+                row[key] = read()
+            except Exception as exc:
+                row[key] = None
+                self.errors.append(f"{key}: {exc}")
+        row['spbm_read_s'] = time.perf_counter() - began
 
     def _run(self):
         while not self.stop.wait(self.interval):

@@ -1,5 +1,10 @@
-# Proposed study, reviewed 2026-11-14. Explicit rung lists keep native-engine
-# pilots separate from the three-representation GGUF comparison.
+# Main study (5 concurrency levels, 30 trials each):
+#   llama.cpp: 2 models x 3 Unsloth GGUF representations          = 30 configurations
+#   vLLM:      Qwen official BF16 / Qwen FP8 / NVIDIA NVFP4 + DeepSeek BF16 = 20
+#   total 50 configurations, 1,500 trials.
+# The engines run DIFFERENT weight files except at BF16 (lossless GGUF conversion
+# vs publisher safetensors). vLLM's GGUF plugin cannot load Qwen3.8 and is slow on
+# quantized GGUF (docs/pilot-findings-vllm.md), so GGUF rows stay llama.cpp-only.
 # DeepSeek here is a disclosed small pilot fallback, NOT the latest V4.1 model.
 defaults:
   kv_dtype_bytes: 2
@@ -9,63 +14,100 @@ concurrency: [1, 2, 4, 8, 16]
 study:
   qa_dataset: data/squad-dev-100.jsonl
   engines: [llama_cpp, vllm]
+  # Engines that run the GGUF `model_rungs` matrix (default: all `engines`).
+  gguf_engines: [llama_cpp]
+  # Light protocol sized for ~4 days of machine time (bandwidth estimate, not
+  # yet measured): each trial is short, and request ids continue across trials
+  # so 30 trials together cover the QA set (>=90 of 100 questions per cell).
   repeats: 30
-  requests_per_agent: 100
-  warmup_requests: 4
-  output_tokens: 256
+  requests_per_agent: 3
+  warmup_requests: 1
+  # One full trial, run and discarded after each server start. The pilot's first
+  # trial per server ran ~2x faster than later ones (docs/pilot-findings-vllm.md).
+  warmup_trials: 1
+  # Raised from 256 after the pilot: 15-20% of answers at c=16 hit 256 before the
+  # reasoning finished. Longest QA prompt ~800 tokens + 2048 fits the 4096 context.
+  output_tokens: 2048
+  # Teacher-forced answer likelihood on the QA set, once per artifact before its
+  # trials: answer perplexity and KL divergence to the BF16 reference
+  # (src/edge_llm_pareto/likelihood.py; summarize with scripts/likelihood_report.py).
+  likelihood: true
+  likelihood_top_k: 20
   context: 4096
   server_parallel: 16
   seed: 42
+  # llama.cpp: Unsloth GGUF. BF16 references are unquantized conversions of the
+  # publisher weights.
   model_rungs:
-    qwen3.8-27b: [gguf-bf16, gguf-q8_0, gguf-ud-q4_k_xl]
-    deepseek-r1-0528-qwen3-8b: [gguf-bf16, gguf-q8_0, gguf-q4_k_m]
-  # Optimized native vLLM deployment (safetensors, continuous batching, compiled
-  # kernels). A second comparison, not part of the same-artifact GGUF matrix:
-  # weight format and quantization recipe change together with the engine.
-  # DeepSeek has no official quantized checkpoint configured, so BF16 only.
+    qwen3.8-27b: [gguf-bf16, gguf-ud-q8_k_xl, gguf-ud-q4_k_xl]
+    deepseek-r1-0528-qwen3-8b: [gguf-bf16, gguf-ud-q8_k_xl, gguf-ud-q4_k_xl]
+  # vLLM: official safetensors only (publisher BF16, publisher FP8, NVIDIA NVFP4).
+  # DeepSeek has no official quantized checkpoint, so it contributes BF16 only.
   native_vllm_rungs:
-    qwen3.8-27b: [native-bf16, official-fp8]
+    qwen3.8-27b: [native-bf16, qwen-fp8, nvidia-nvfp4]
     deepseek-r1-0528-qwen3-8b: [native-bf16]
+# `revision` pins each Hugging Face repo to an immutable commit (checked
+# 2026-11-16). Unsloth re-uploads quants (Dynamic V3.1 on 2026-11-12), so never
+# follow `main` during collection. `linear_bits` only drives the memory planner:
+# UD quants keep some tensors at higher precision, so values are effective
+# bits/weight from published file sizes, not nominal type widths.
 models:
   qwen3.8-27b:
     shape_from: Qwen/Qwen3.8-27B
+    shape_revision: 37561816e66b5b9153b1b64c10968c18c1e6f4a0
     params: 27000000000
     budget_note: "Hybrid text/vision model: dense-equivalent weights and full-attention KV estimates are provisional; recurrent state, vision allocations and kernel support need Spark validation."
     engine_rungs:
       llama_cpp:
         repo: unsloth/Qwen3.8-27B-GGUF
+        revision: 4af51b3542f775b0a8e4b310bfb3f17e01c306c9
         default_rung: gguf-ud-q4_k_xl
         rungs:
-          - {rung: gguf-bf16, file: Qwen3.8-27B-BF16.gguf, linear_bits: 16}
-          - {rung: gguf-q8_0, file: Qwen3.8-27B-Q8_0.gguf, linear_bits: 8}
-          - {rung: gguf-ud-q4_k_xl, file: Qwen3.8-27B-UD-Q4_K_XL.gguf, linear_bits: 4.5}
+          - {rung: gguf-bf16, file: BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf, linear_bits: 16}
+          - {rung: gguf-ud-q8_k_xl, file: Qwen3.8-27B-UD-Q8_K_XL.gguf, linear_bits: 9.3}
+          - {rung: gguf-ud-q4_k_xl, file: Qwen3.8-27B-UD-Q4_K_XL.gguf, linear_bits: 5.2}
       vllm:
         repo: unsloth/Qwen3.8-27B-GGUF
+        revision: 4af51b3542f775b0a8e4b310bfb3f17e01c306c9
         default_rung: native-bf16
-        # GGUF rows require the vLLM GGUF plugin and are experimental. They
-        # measure identical artifacts across engines, not optimized native vLLM.
+        # Study rows are the native safetensors rungs (see native_vllm_rungs).
+        # GGUF rows need the experimental vLLM GGUF plugin; kept only to
+        # reproduce the pilot (Qwen3.8 GGUF does not load on vLLM).
         rungs:
-          - {rung: native-bf16, repo: Qwen/Qwen3.8-27B, linear_bits: 16, dtype: bfloat16}
-          - {rung: official-fp8, repo: Qwen/Qwen3.8-27B-FP8, linear_bits: 8, dtype: bfloat16}
-          - {rung: gguf-bf16, file: Qwen3.8-27B-BF16.gguf, linear_bits: 16, dtype: float16}
-          - {rung: gguf-q8_0, file: Qwen3.8-27B-Q8_0.gguf, linear_bits: 8, dtype: float16}
-          - {rung: gguf-ud-q4_k_xl, file: Qwen3.8-27B-UD-Q4_K_XL.gguf, linear_bits: 4.5, dtype: float16}
+          - {rung: native-bf16, repo: Qwen/Qwen3.8-27B, revision: 37561816e66b5b9153b1b64c10968c18c1e6f4a0, linear_bits: 16, dtype: bfloat16}
+          # Qwen's official FP8: fine-grained FP8, block size 128; 30.9 GB.
+          - {rung: qwen-fp8, repo: Qwen/Qwen3.8-27B-FP8, revision: c3a462cc3d38cf351f3b26cbd763469eeb74ef81, linear_bits: 9.2, dtype: bfloat16}
+          # NVIDIA ModelOpt NVFP4 (Local-Hessian calibration): NVFP4 MLPs and
+          # lm_head, FP8 attention and linear attention; 21.9 GB including the
+          # vision tower. The card recommends an FP8 KV cache; the study keeps
+          # BF16 KV for every row. The card uses vLLM nightly: validate on Spark.
+          - {rung: nvidia-nvfp4, repo: nvidia/Qwen3.8-27B-NVFP4, revision: 482ca0f3832238542f8f5295dde86b5f22711d80, linear_bits: 6.5, dtype: bfloat16}
+          # Optional comparison only (not in the study): Unsloth's NVFP4 recipe.
+          # Unsloth Dynamic NVFP4 (compressed-tensors): NVFP4 MLPs, FP8 attention,
+          # lm_head and last 8 MLP layers; 23.4 GB including the vision tower.
+          - {rung: unsloth-nvfp4, repo: unsloth/Qwen3.8-27B-NVFP4, revision: f0b7c9e722f5565102fff8481c99e4d86ae099c7, linear_bits: 6.9, dtype: bfloat16}
+          - {rung: gguf-bf16, file: BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf, linear_bits: 16, dtype: float16}
+          - {rung: gguf-ud-q8_k_xl, file: Qwen3.8-27B-UD-Q8_K_XL.gguf, linear_bits: 9.3, dtype: float16}
+          - {rung: gguf-ud-q4_k_xl, file: Qwen3.8-27B-UD-Q4_K_XL.gguf, linear_bits: 5.2, dtype: float16}
   deepseek-r1-0528-qwen3-8b:
     shape_from: deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
+    shape_revision: 6e8885a6ff5c1dc5201574c8fd700323f23c25fa
     params: 8190000000
     engine_rungs:
       llama_cpp:
         repo: unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF
-        default_rung: gguf-q4_k_m
+        revision: eb48357c179d34dbf515983f798dfb8752a0f261
+        default_rung: gguf-ud-q4_k_xl
         rungs:
           - {rung: gguf-bf16, file: DeepSeek-R1-0528-Qwen3-8B-BF16.gguf, linear_bits: 16}
-          - {rung: gguf-q8_0, file: DeepSeek-R1-0528-Qwen3-8B-Q8_0.gguf, linear_bits: 8}
-          - {rung: gguf-q4_k_m, file: DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf, linear_bits: 4.5}
+          - {rung: gguf-ud-q8_k_xl, file: DeepSeek-R1-0528-Qwen3-8B-UD-Q8_K_XL.gguf, linear_bits: 10.5}
+          - {rung: gguf-ud-q4_k_xl, file: DeepSeek-R1-0528-Qwen3-8B-UD-Q4_K_XL.gguf, linear_bits: 5.0}
       vllm:
         repo: unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF
+        revision: eb48357c179d34dbf515983f798dfb8752a0f261
         default_rung: native-bf16
         rungs:
-          - {rung: native-bf16, repo: deepseek-ai/DeepSeek-R1-0528-Qwen3-8B, linear_bits: 16, dtype: bfloat16}
+          - {rung: native-bf16, repo: deepseek-ai/DeepSeek-R1-0528-Qwen3-8B, revision: 6e8885a6ff5c1dc5201574c8fd700323f23c25fa, linear_bits: 16, dtype: bfloat16}
           - {rung: gguf-bf16, file: DeepSeek-R1-0528-Qwen3-8B-BF16.gguf, linear_bits: 16, dtype: float16}
-          - {rung: gguf-q8_0, file: DeepSeek-R1-0528-Qwen3-8B-Q8_0.gguf, linear_bits: 8, dtype: float16}
-          - {rung: gguf-q4_k_m, file: DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf, linear_bits: 4.5, dtype: float16}
+          - {rung: gguf-ud-q8_k_xl, file: DeepSeek-R1-0528-Qwen3-8B-UD-Q8_K_XL.gguf, linear_bits: 10.5, dtype: float16}
+          - {rung: gguf-ud-q4_k_xl, file: DeepSeek-R1-0528-Qwen3-8B-UD-Q4_K_XL.gguf, linear_bits: 5.0, dtype: float16}

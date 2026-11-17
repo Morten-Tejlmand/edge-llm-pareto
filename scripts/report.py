@@ -60,14 +60,22 @@ def main() -> int:
     ap.add_argument("results", nargs="+", help="jsonl paths or globs")
     ap.add_argument("--energy", action="store_true")
     ap.add_argument("--export-dir", default="results/report")
-    ap.add_argument("--objective", choices=["output_tok_s", "latency_s_p95"], default="output_tok_s")
+    ap.add_argument("--energy-scope", choices=["nvml", "system", "system_total", "soc", "gpu"],
+                    default="nvml", help="nvml = NVML GPU power; others use the Spark spbm rails")
+    ap.add_argument("--objective", choices=["output_tok_s", "latency_s_p95", "ttft_s_p95", "throughput_ttft"],
+                    default="output_tok_s",
+                    help="axis ranked against J/output token; throughput_ttft ranks J/token, tokens/s and p95 TTFT together")
     ap.add_argument("--baseline", help="configuration ID to compare within its matching group")
     ap.add_argument("--min-quality", type=float)
     ap.add_argument('--perplexity-results', nargs='+', help='JSON bundles from perplexity.py')
     ap.add_argument('--max-perplexity-increase-pct', type=float)
+    ap.add_argument('--likelihood-results', help='JSON bundle from likelihood_report.py (QA answer PPL and KL columns)')
     ap.add_argument('--combine-models', action='store_true', help='compare models on matched workloads; relative PPL loss is not equal task quality')
     args = ap.parse_args()
-    if (args.perplexity_results or args.max_perplexity_increase_pct is not None or args.combine_models) and not args.energy:
+    if args.energy_scope != 'nvml' and not args.energy:
+        ap.error('--energy-scope requires --energy')
+    if (args.perplexity_results or args.likelihood_results or args.max_perplexity_increase_pct is not None
+            or args.combine_models) and not args.energy:
         ap.error('perplexity and combined-model options require --energy')
     if args.max_perplexity_increase_pct is not None and not args.perplexity_results:
         ap.error('perplexity filtering requires --perplexity-results')
@@ -78,12 +86,16 @@ def main() -> int:
         return 1
 
     if args.energy:
-        from edge_llm_pareto.analysis import export
+        from edge_llm_pareto.analysis import export, with_energy_scope
+        rows = [with_energy_scope(r, args.energy_scope) for r in rows]
         try:
             if args.perplexity_results:
                 from edge_llm_pareto.perplexity import attach_results
                 from pathlib import Path
                 rows = attach_results(rows, [json.loads(Path(p).read_text()) for p in args.perplexity_results])
+            if args.likelihood_results:
+                from edge_llm_pareto.analysis import attach_likelihood
+                rows = attach_likelihood(rows, json.loads(Path(args.likelihood_results).read_text()))
             data = export(rows, args.export_dir, args.objective, args.baseline, args.min_quality,
                           args.max_perplexity_increase_pct, args.combine_models)
             if args.combine_models and args.min_quality is None:

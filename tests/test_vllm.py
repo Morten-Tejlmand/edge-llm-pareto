@@ -81,7 +81,11 @@ class VllmTests(unittest.TestCase):
         self.assertEqual(cmd[2], '/cache/test.gguf')
         self.assertEqual(cmd[cmd.index('--quantization') + 1], 'gguf')
         self.assertEqual(cmd[cmd.index('--tokenizer-revision') + 1], 'pinned-native')
+        # vLLM fetches the base config with --revision: it must be the tokenizer
+        # repo's commit, never the GGUF repo's (which 404s in the base repo).
+        self.assertEqual(cmd[cmd.index('--revision') + 1], 'pinned-native')
         self.assertEqual(row['gguf']['revision'], 'abc')
+        self.assertEqual(row['model_revision'], 'abc')
 
     def test_native_startup_failure_is_recorded_and_process_stopped(self):
         with tempfile.TemporaryDirectory() as d:

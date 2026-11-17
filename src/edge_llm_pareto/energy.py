@@ -2,13 +2,12 @@
 import math
 
 
-def integrate(samples, start, end, max_gap_s=0.5):
+def integrate(samples, start, end, max_gap_s=0.5, value=lambda s: s.get("power_w")):
     result = {"run_energy_j": None, "energy_coverage": 0.0, "energy_valid": False}
     if end <= start:
         return result
-    points = sorted((s["t"], s["power_w"]) for s in samples
-                    if s.get("power_w") is not None and math.isfinite(s["power_w"])
-                    and s["power_w"] >= 0)
+    points = sorted((s["t"], w) for s in samples for w in [value(s)]
+                    if w is not None and math.isfinite(w) and w >= 0)
     energy = covered = 0.0
     for (a, pa), (b, pb) in zip(points, points[1:]):
         lo, hi = max(a, start), min(b, end)

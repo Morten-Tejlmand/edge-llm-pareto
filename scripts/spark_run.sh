@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 # One-shot runner for the DGX Spark (GB10): setup, model download, smoke test,
 # then the selected study run and report. Safe to re-run: every step reuses
-# what already exists (venv, llama.cpp build, Hugging Face cache).
+# what already exists (venv, llama.cpp build, Hugging Face cache), and an
+# interrupted pilot/full run continues from results/<mode>/, skipping
+# completed trials. vLLM is found automatically ($VLLM, PATH, ~/vllm-env, ...).
 #
 # Usage (from the repository root, ideally inside tmux):
 #   scripts/spark_run.sh smoke   # setup + one quick trial per engine (~30 min)
 #   scripts/spark_run.sh pilot   # smoke + pilot subset (~11 h estimate)
-#   scripts/spark_run.sh full    # smoke + full study, 1,800 trials (~4 days estimate)
+#   scripts/spark_run.sh full    # smoke + full study, 1,500 trials (re-estimate from pilot)
 #
 # Optional environment variables:
 #   LLAMA_SERVER=/path/to/llama-server   use an existing build instead of building
 #   LLAMA_CPP_DIR=$HOME/llama.cpp        where to clone/build llama.cpp
-#   VLLM=/path/to/vllm                   vLLM executable (with vllm-gguf-plugin);
-#                                        if absent, only llama.cpp is run
+#   VLLM=/path/to/vllm                   only needed if vLLM is somewhere unusual;
+#                                        if none is found, only llama.cpp is run
 #   HF_TOKEN=...                         Hugging Face token, if downloads need one
+#   ENGINES=llama_cpp                    run llama.cpp only, even if vLLM is installed
 #   SKIP_SMOKE=1                         skip the smoke test (not recommended)
 set -euo pipefail
 
@@ -84,13 +87,45 @@ fi
 
 # ---------------------------------------------------------------- vLLM
 step "vLLM runtime"
-ENGINES="llama_cpp,vllm"
-VLLM="${VLLM:-$(command -v vllm || true)}"
-if [ -n "$VLLM" ] && "$VLLM" --version >/dev/null 2>&1; then
+ENGINES="${ENGINES:-llama_cpp,vllm}"
+find_vllm() {  # first working vllm: $VLLM, PATH, then common virtualenv locations
+  local candidate
+  for candidate in "${VLLM:-}" "$(command -v vllm 2>/dev/null || true)" \
+      "$HOME/vllm-env/bin/vllm" "$HOME/.vllm-env/bin/vllm" "$HOME/vllm/.venv/bin/vllm" \
+      "$HOME"/*/bin/vllm "$HOME"/*/.venv/bin/vllm "$HOME"/.venv*/bin/vllm /opt/*/bin/vllm; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+    [ "$candidate" -ef "$ROOT/.venv/bin/vllm" ] && continue   # never the project env
+    if "$candidate" --version >/dev/null 2>&1; then echo "$candidate"; return 0; fi
+  done
+  return 1
+}
+if [ "$ENGINES" = "llama_cpp" ]; then
+  echo "ENGINES=llama_cpp: vLLM is skipped for this run."
+  VLLM="vllm"
+elif VLLM="$(find_vllm)"; then
   echo "vLLM: $VLLM ($("$VLLM" --version 2>&1 | tail -1))"
+  # vLLM compiles kernels at startup (FlashInfer, torch inductor): it needs
+  # ninja and the CUDA compiler on PATH, and CUDA_HOME. Without them it fails
+  # with "No such file or directory: 'ninja'" or silently disables FlashInfer.
+  VLLM_BIN_DIR="$(dirname "$VLLM")"
+  CUDA_HOME="${CUDA_HOME:-$(dirname "$(dirname "${NVCC:-/usr/local/cuda/bin/nvcc}")")}"
+  [ -x "$CUDA_HOME/bin/nvcc" ] || echo "WARNING: no nvcc at $CUDA_HOME/bin; set CUDA_HOME. vLLM kernel compilation may fail."
+  export CUDA_HOME PATH="$PATH:$CUDA_HOME/bin:$VLLM_BIN_DIR"
+  if ! command -v ninja >/dev/null; then
+    echo "Installing ninja into $(dirname "$VLLM_BIN_DIR") (needed by vLLM)"
+    uv pip install --python "$VLLM_BIN_DIR/python" ninja \
+      || die "Could not install ninja; run: uv pip install --python $VLLM_BIN_DIR/python ninja"
+  fi
+  echo "ninja: $(command -v ninja)  nvcc: $(command -v nvcc || echo missing)  CUDA_HOME=$CUDA_HOME"
+  # Prebuilt kernels avoid slow, variable compilation at every server start.
+  KERNEL_MARK="$HOME/.cache/edge-llm-pareto/vllm-kernels-$("$VLLM" --version 2>&1 | tail -1)"
+  if [ ! -e "$KERNEL_MARK" ]; then
+    if "$VLLM" download-kernels; then mkdir -p "$(dirname "$KERNEL_MARK")"; touch "$KERNEL_MARK";
+    else echo "Note: 'vllm download-kernels' failed; vLLM will compile kernels at startup instead."; fi
+  fi
 else
-  echo "WARNING: no working vLLM found (set VLLM=/path/to/vllm)."
-  echo "         Set it up with NVIDIA's Spark vLLM playbook plus vllm-gguf-plugin;"
+  echo "WARNING: no working vLLM found (searched \$VLLM, PATH, ~/vllm-env and other ~/*/bin)."
+  echo "         Set it up with NVIDIA's Spark vLLM playbook;"
   echo "         see docs/engines.md. Continuing with llama.cpp only."
   ENGINES="llama_cpp"
   VLLM="vllm"
@@ -115,13 +150,21 @@ COMMON=(--engines "$ENGINES" --llama-server "$LLAMA_SERVER" --vllm "$VLLM")
 
 run_study() {  # $1 = results dir, rest = extra qa_study arguments
   local dir="$1"; shift
-  "$PY" scripts/qa_study.py "${COMMON[@]}" --results-dir "$dir" "$@" --dry-run | sed -n 1p
+  "$PY" scripts/qa_study.py "${COMMON[@]}" --results-dir "$dir" "$@" --dry-run | sed -n '/^Resuming/p; /^Planned/p'
   "$PY" scripts/qa_study.py "${COMMON[@]}" --results-dir "$dir" "$@"
 }
 
 report() {  # $1 = results dir
   step "Report for $1"
-  "$PY" scripts/report.py "$1/*.jsonl" --energy --export-dir "$1/report" \
+  local extra=()
+  if ls "$1"/*.likelihood.json >/dev/null 2>&1; then
+    if "$PY" scripts/likelihood_report.py "$1/*.likelihood.json" --output "$1/report/likelihood.json"; then
+      extra=(--likelihood-results "$1/report/likelihood.json")
+    else
+      echo "Likelihood summary failed; the energy report continues without QA perplexity/KL."
+    fi
+  fi
+  "$PY" scripts/report.py "$1/*.jsonl" --energy --export-dir "$1/report" "${extra[@]}" \
     || echo "Report failed or found no valid rows; inspect $1 and the server logs there."
 }
 
@@ -146,9 +189,9 @@ EOF
 
 # ---------------------------------------------------------------- smoke
 if [ "${SKIP_SMOKE:-0}" != "1" ]; then
-  step "Smoke test: DeepSeek 8B UD-Q4_K_XL, concurrency 1, one trial per engine"
+  step "Smoke test: DeepSeek 8B (llama.cpp UD-Q4_K_XL, vLLM BF16), concurrency 1, one trial"
   SMOKE_DIR="results/smoke-$STAMP"
-  run_study "$SMOKE_DIR" --models deepseek-r1-0528-qwen3-8b --rungs gguf-ud-q4_k_xl \
+  run_study "$SMOKE_DIR" --models deepseek-r1-0528-qwen3-8b --rungs gguf-ud-q4_k_xl,native-bf16 \
     --concurrency 1 --repeats 1 || die "Smoke test failed; see $SMOKE_DIR and $LOG."
   BAD=$(skipped_rows "$SMOKE_DIR")
   [ "$BAD" = "0" ] || die "Smoke test recorded $BAD skipped/failed rows; see $SMOKE_DIR."
@@ -157,17 +200,21 @@ fi
 [ "$MODE" = "smoke" ] && { step "Done (smoke only)."; exit 0; }
 
 # ---------------------------------------------------------------- main run
+# Fixed folder per mode: re-running the script continues an interrupted run
+# (completed trials are skipped). To start over, rename or delete the folder.
+OUT="results/$MODE"
+if ls "$OUT"/*.jsonl >/dev/null 2>&1; then
+  echo "Existing results in $OUT: resuming; completed trials will be skipped."
+fi
 if [ "$MODE" = "pilot" ]; then
-  OUT="results/pilot-$STAMP"
   step "Pilot: all models and quantizations, concurrency 1,4,16, 5 trials (~11 h estimate)"
-  run_study "$OUT" --concurrency 1,4,16 --repeats 5 || echo "Some pilot cells failed; continuing to the report."
+  run_study "$OUT" --concurrency 1,4,16 --repeats 5 --resume || echo "Some pilot cells failed; continuing to the report."
 else
-  OUT="results/full-$STAMP"
-  step "Full study: 60 configurations x 30 trials (~4 days estimate)"
-  run_study "$OUT" || echo "Some study cells failed; continuing to the report."
+  step "Full study: 50 configurations x 30 trials"
+  run_study "$OUT" --resume || echo "Some study cells failed; continuing to the report."
 fi
 
 BAD=$(skipped_rows "$OUT")
-echo "Skipped/failed rows: $BAD"
+echo "Skipped/failed rows (including attempts before a resume): $BAD"
 report "$OUT"
 step "Finished. Results: $OUT   Log: $LOG"

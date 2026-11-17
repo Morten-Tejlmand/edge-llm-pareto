@@ -16,7 +16,7 @@ import time
 from contextlib import nullcontext
 
 from .telemetry import PowerMonitor
-from .gsmm import power_record, measure_reference, adjusted_energy
+from .gsmm import power_record, measure_reference, adjusted_energy, scope_energy_fields
 from .results import read_records
 
 
@@ -245,6 +245,10 @@ async def run_concurrency_level(
         energy = record.get("run_energy_j")
         record["joules_per_output_token"] = (energy / out_tokens if energy is not None
             and out_tokens and record["token_counts_exact"] and not failed else None)
+        if 'spbm' in record:
+            record.update(scope_energy_fields(
+                record, dict(system_baseline=system_baseline, server_idle=idle),
+                record["token_counts_exact"] and not failed))
     if power and power.scope == "nvml_device":
         record["gpu"] = power.summary()
         if power.errors:
@@ -285,7 +289,17 @@ def stable_id(value):
 async def sweep(base_url, model, concurrency_levels, wl, label, out_path=None,
                 requests_per_agent=3, metadata=None, repeats=1, warmup_requests=0,
                 seed=0, resume=False, workloads=None, idle_seconds=0,
-                telemetry_interval=.1, system_baseline=None, reference_path=None):
+                telemetry_interval=.1, system_baseline=None, reference_path=None,
+                warmup_trials=0):
+    """Run every (workload, concurrency, trial) job once, in seeded random order.
+
+    `warmup_trials` full trials are run and discarded before the first measured
+    trial on this server, using the first pending job's workload and concurrency.
+    The pilot showed the first trial after each server start running ~2x faster
+    than later ones, which biased whichever cell the seed placed first.
+    """
+    if warmup_trials < 0:
+        raise ValueError("warmup_trials must be nonnegative")
     metadata = metadata or {}
     completed = set()
     if resume and out_path and Path(out_path).exists():
@@ -297,8 +311,8 @@ async def sweep(base_url, model, concurrency_levels, wl, label, out_path=None,
     jobs = [(w, c, trial) for w in (workloads or [wl])
             for c in concurrency_levels for trial in range(repeats)]
     random.Random(seed).shuffle(jobs)
-    rows = []
-    for w, c, trial in jobs:
+
+    def ids(w, c, trial):
         identity = {k: v for k, v in metadata.items()
                     if k not in ("hardware", "kv_ceiling_agents", "quality", "environment", "session_observations")}
         hardware = metadata.get("hardware", {})
@@ -309,10 +323,25 @@ async def sweep(base_url, model, concurrency_levels, wl, label, out_path=None,
             baseline_seconds=system_baseline.get('requested_duration_s', 0) if system_baseline else 0,
             telemetry_interval_s=telemetry_interval, energy_basis='gross',
             adjustment_method='reference_mean_power_times_duration_v1')
+        if warmup_trials:  # Omitted when 0 so earlier results keep their trial IDs.
+            identity['measurement_protocol']['warmup_trials'] = warmup_trials
         config_id = stable_id(identity)
-        trial_id = stable_id([config_id, trial])
-        if trial_id in completed:
-            continue
+        return identity, config_id, stable_id([config_id, trial])
+
+    pending = [(w, c, trial) for w, c, trial in jobs if ids(w, c, trial)[2] not in completed]
+    if pending and warmup_trials:
+        w, c, _ = pending[0]
+        for i in range(warmup_trials):
+            # Unmeasured and unrecorded. Request ids sit past every measured
+            # trial's range so the discarded trial never reuses their prompts.
+            discarded = await run_concurrency_level(base_url, model, c, w, requests_per_agent,
+                                                    monitor_gpu=False, warmup_requests=warmup_requests,
+                                                    request_offset=(repeats + i) * c * requests_per_agent)
+            print(f"  {label} c={c} warmup trial {i + 1}/{warmup_trials} (discarded): "
+                  f"{discarded['output_tok_s']} tok/s, {discarded['failed']} failed", flush=True)
+    rows = []
+    for w, c, trial in pending:
+        identity, config_id, trial_id = ids(w, c, trial)
         row = await run_concurrency_level(base_url, model, c, w, requests_per_agent,
                                           warmup_requests=warmup_requests, idle_seconds=idle_seconds,
                                           telemetry_interval=telemetry_interval, system_baseline=system_baseline,

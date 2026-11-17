@@ -14,14 +14,9 @@ CONFIG_PATH = ROOT / 'configs/study.yaml'
 CONFIG = yaml.safe_load(CONFIG_PATH.read_text())
 
 
-NATIVE = {'qwen3.8-27b': ['native-bf16', 'unsloth-nvfp4'],
+NATIVE = {'qwen3.8-27b': ['native-bf16', 'qwen-fp8', 'nvidia-nvfp4'],
           'deepseek-r1-0528-qwen3-8b': ['native-bf16']}
-
-
-def with_native(config):
-    config = copy.deepcopy(config)
-    config['study']['native_vllm_rungs'] = copy.deepcopy(NATIVE)
-    return config
+OFFICIAL_PUBLISHERS = ('Qwen/', 'deepseek-ai/', 'nvidia/')
 
 
 def build(config):
@@ -34,20 +29,47 @@ def rows(commands):
 
 
 class StudyMatrixTest(unittest.TestCase):
-    def test_main_study_is_1800_trials(self):
+    def test_main_study_is_1500_trials(self):
         commands, configurations, trials = build(CONFIG)
-        # 2 models x 3 GGUF rungs x 2 engines x 5 concurrency levels.
-        self.assertEqual(configurations, 60)
-        self.assertEqual(trials, 1800)
-        self.assertEqual(len(commands), 4)
+        # llama.cpp: 2 models x 3 GGUF rungs; vLLM: 3 Qwen + 1 DeepSeek native rungs;
+        # each x 5 concurrency levels.
+        self.assertEqual(configurations, (6 + 4) * 5)
+        self.assertEqual(trials, 1500)
+        self.assertEqual(sorted(rows(commands)), sorted([
+            ('qwen3.8-27b', 'llama_cpp', 'gguf-bf16,gguf-ud-q8_k_xl,gguf-ud-q4_k_xl'),
+            ('deepseek-r1-0528-qwen3-8b', 'llama_cpp', 'gguf-bf16,gguf-ud-q8_k_xl,gguf-ud-q4_k_xl'),
+            ('qwen3.8-27b', 'vllm', 'native-bf16,qwen-fp8,nvidia-nvfp4'),
+            ('deepseek-r1-0528-qwen3-8b', 'vllm', 'native-bf16')]))
 
-    def test_optional_native_vllm_rows(self):
-        config = with_native(CONFIG)
-        commands, configurations, trials = build(config)
-        self.assertIn(('qwen3.8-27b', 'vllm', 'native-bf16,unsloth-nvfp4'), rows(commands))
-        self.assertIn(('deepseek-r1-0528-qwen3-8b', 'vllm', 'native-bf16'), rows(commands))
-        self.assertEqual(configurations, 60 + 15)
-        self.assertEqual(trials, 75 * 30)
+    def test_every_sweep_scores_answer_likelihood(self):
+        commands, _, _ = build(CONFIG)
+        for c in commands:
+            self.assertEqual(c[c.index('--likelihood-dataset') + 1], 'qa.jsonl')
+        config = copy.deepcopy(CONFIG)
+        config['study']['likelihood'] = False
+        self.assertTrue(all('--likelihood-dataset' not in c for c in build(config)[0]))
+
+    def test_gguf_engines_default_to_all_engines(self):
+        config = copy.deepcopy(CONFIG)
+        del config['study']['gguf_engines']
+        config['study'].pop('native_vllm_rungs')
+        _, configurations, _ = build(config)
+        self.assertEqual(configurations, 2 * 3 * 2 * 5)
+
+    def test_rejects_gguf_engine_outside_study_engines(self):
+        config = copy.deepcopy(CONFIG)
+        config['study']['gguf_engines'] = ['llama_cpp', 'sglang']
+        with self.assertRaises(ValueError):
+            build(config)
+
+    def test_engine_subsets(self):
+        llama = qa_study.subset(CONFIG, engines=['llama_cpp'])
+        self.assertEqual({r[1] for r in rows(build(llama)[0])}, {'llama_cpp'})
+        vllm = qa_study.subset(CONFIG, engines=['vllm'])
+        self.assertEqual({r[1] for r in rows(build(vllm)[0])}, {'vllm'})
+        self.assertEqual(build(vllm)[1], 4 * 5)
+        with self.assertRaises(ValueError):  # GGUF rungs are not run on vLLM
+            qa_study.subset(CONFIG, engines=['vllm'], rungs=['gguf-bf16'])
 
     def test_pilot_subset_filters_rungs_and_concurrency(self):
         config = qa_study.subset(CONFIG, rungs=['gguf-bf16', 'gguf-ud-q4_k_xl'],
@@ -63,20 +85,50 @@ class StudyMatrixTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 qa_study.subset(CONFIG, **kwargs)
 
-    def test_every_quantized_artifact_is_unsloth_and_pinned(self):
-        for model, labels in CONFIG['study']['model_rungs'].items():
-            for engine in CONFIG['study']['engines']:
-                engine_cfg = CONFIG['models'][model]['engine_rungs'][engine]
-                rungs = {r['rung']: r for r in engine_cfg['rungs']}
-                for label in labels + NATIVE.get(model, []):
-                    if label not in rungs:
-                        continue
-                    rung = rungs[label]
-                    repo = rung.get('repo', engine_cfg['repo'])
-                    revision = rung.get('revision') if 'repo' in rung else engine_cfg.get('revision')
-                    self.assertRegex(revision or '', r'^[0-9a-f]{40}$', (model, label))
-                    if rung['linear_bits'] < 16:
-                        self.assertTrue(repo.startswith('unsloth/'), (model, label, repo))
+    def test_resume_attaches_matching_earlier_results(self):
+        import json, tempfile
+        commands, _, _ = build(CONFIG)
+        with tempfile.TemporaryDirectory() as d:
+            done = Path(d) / 'qwen3.8-27b-llama_cpp-20260101-000000.jsonl'
+            done.write_text(json.dumps({'label': 'gguf-bf16', 'trial': 0}) + '\n')
+            other = Path(d) / 'qwen3.8-27b-vllm-20260101-000000.jsonl'
+            other.write_text(json.dumps({'label': 'unsloth-nvfp4'}) + '\n')  # not a study rung
+            resumed = qa_study.add_resume(commands, d)
+        self.assertEqual(resumed, [done])
+        resumed_cmds = [c for c in commands if '--resume' in c]
+        self.assertEqual(len(resumed_cmds), 1)
+        self.assertEqual(resumed_cmds[0][resumed_cmds[0].index('--model') + 1], 'qwen3.8-27b')
+        self.assertEqual(resumed_cmds[0][resumed_cmds[0].index('--engine') + 1], 'llama_cpp')
+
+    def test_resume_refuses_ambiguous_earlier_results(self):
+        import json, tempfile
+        commands, _, _ = build(CONFIG)
+        with tempfile.TemporaryDirectory() as d:
+            for stamp in ('20260101-000000', '20260102-000000'):
+                (Path(d) / f'qwen3.8-27b-llama_cpp-{stamp}.jsonl').write_text(
+                    json.dumps({'label': 'gguf-bf16'}) + '\n')
+            with self.assertRaises(ValueError):
+                qa_study.add_resume(commands, d)
+
+    def test_artifacts_are_pinned_unsloth_gguf_or_official_native(self):
+        study = CONFIG['study']
+        self.assertEqual(study['native_vllm_rungs'], NATIVE)
+        cells = [(m, e, labels) for m, labels in study['model_rungs'].items()
+                 for e in study['gguf_engines']]
+        cells += [(m, 'vllm', labels) for m, labels in study['native_vllm_rungs'].items()]
+        for model, engine, labels in cells:
+            engine_cfg = CONFIG['models'][model]['engine_rungs'][engine]
+            rungs = {r['rung']: r for r in engine_cfg['rungs']}
+            for label in labels:
+                rung = rungs[label]
+                repo = rung.get('repo', engine_cfg['repo'])
+                revision = rung.get('revision') if 'repo' in rung else engine_cfg.get('revision')
+                self.assertRegex(revision or '', r'^[0-9a-f]{40}$', (model, label))
+                if engine == 'llama_cpp':
+                    self.assertTrue(repo.startswith('unsloth/'), (model, label, repo))
+                else:
+                    self.assertNotIn('file', rung, (model, label))
+                    self.assertTrue(repo.startswith(OFFICIAL_PUBLISHERS), (model, label, repo))
 
     def test_rejects_native_rung_missing_from_vllm(self):
         config = copy.deepcopy(CONFIG)
@@ -91,8 +143,9 @@ class StudyMatrixTest(unittest.TestCase):
             build(config)
 
     def test_rejects_native_rows_without_vllm_engine(self):
-        config = with_native(CONFIG)
+        config = copy.deepcopy(CONFIG)
         config['study']['engines'] = ['llama_cpp']
+        config['study']['gguf_engines'] = ['llama_cpp']
         with self.assertRaises(ValueError):
             build(config)
 

@@ -1,0 +1,3 @@
+{"id":"addition","prompt":"What is 17 + 25? Reply with only the number.","answers":["42"]}
+{"id":"ordering","prompt":"Sort these integers in ascending order: 9, 2, 5. Reply only with the numbers separated by commas and spaces.","answers":["2, 5, 9"]}
+{"id":"extraction","prompt":"Record: name=Alex; city=Aarhus; age=31. What is the city? Reply only with its name.","answers":["Aarhus"]}

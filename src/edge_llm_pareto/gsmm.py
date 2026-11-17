@@ -13,6 +13,7 @@ import time
 import uuid
 
 from .energy import integrate
+from . import spbm as spbm_sensor
 from .telemetry import PowerMonitor
 
 
@@ -68,7 +69,65 @@ def power_record(monitor, start, end):
                       max_interval_s=max(gaps) if gaps else None),
                   unexpected_thermal_throttling=(any(m & (32 | 64) for m in masks if m is not None)
                     if any(m is not None for m in masks) else None))
+    result.update(spbm_record(monitor, start, end, result))
     return result
+
+
+def spbm_record(monitor, start, end, nvml):
+    """Per-rail energy from the Spark spbm device, plus cross-checks.
+
+    Adds nothing when the device is absent, so other platforms keep their schema.
+    Top-level fields name the scope; the full per-rail detail sits under `spbm`.
+    """
+    device = getattr(monitor, 'spbm', None)
+    if device is None:
+        return {}
+    samples, gap = monitor.samples, monitor.interval * 5
+    rails = {}
+    for label in device.channels['power']:
+        def value(s, label=label):
+            return (s.get('spbm_power_w') or {}).get(label)
+        r = integrate(samples, start, end, gap, value)
+        watts = [value(s) for s in samples if start <= s['t'] <= end and value(s) is not None]
+        rails[label] = dict(energy_j=r['run_energy_j'], valid=r['energy_valid'],
+                            coverage=r['energy_coverage'],
+                            mean_w=r['run_energy_j'] / (end - start) if r['energy_valid'] else None,
+                            max_w=max(watts) if watts else None)
+    counters = {}
+    for label in device.channels['energy']:
+        counters[label] = dict(energy_j=spbm_sensor.counter_delta(samples, start, end, label),
+                               update_interval_s=spbm_sensor.counter_update_interval(samples, label))
+    temps = {}
+    for label in device.channels['temp']:
+        values = [s['spbm_temp_c'][label] for s in samples
+                  if start <= s['t'] <= end and label in (s.get('spbm_temp_c') or {})]
+        if values:
+            temps[label] = dict(mean=statistics.fmean(values), max=max(values))
+    limits = {}
+    for label in device.limits:
+        values = [s['spbm_limit_w'][label] for s in samples
+                  if start <= s['t'] <= end and label in (s.get('spbm_limit_w') or {})]
+        if values:
+            limits[label] = dict(mean_w=statistics.fmean(values), max_w=max(values))
+    reads = [s['spbm_read_s'] for s in samples if s.get('spbm_read_s') is not None]
+    nvml_j = nvml.get('run_energy_j') if nvml.get('energy_scope') == 'nvml_device' else None
+
+    def rail_j(label):
+        return (rails.get(label) or {}).get('energy_j')
+
+    checks = dict(
+        spbm_gpu_over_nvml=spbm_sensor.ratio(rail_j('gpu'), nvml_j),
+        **{f'{c}_counter_over_{r}_integrated': spbm_sensor.ratio(
+            (counters.get(c) or {}).get('energy_j'), rail_j(r))
+           for c, r in spbm_sensor.COUNTER_CHECKS.items()})
+    out = {f'{scope}_energy_j': rail_j(label) for scope, label in spbm_sensor.SCOPES.items()}
+    out['spbm'] = dict(
+        sensor=device.describe(), rails=rails, counters=counters,
+        temperatures_c=temps, power_limits=limits, crosscheck=checks,
+        read_s_mean=statistics.fmean(reads) if reads else None,
+        read_s_max=max(reads) if reads else None,
+        rail_meaning='inferred from driver labels; not confirmed by driver documentation')
+    return out
 
 
 async def measure_reference(scenario, seconds, interval=.1):
@@ -90,6 +149,8 @@ async def measure_reference(scenario, seconds, interval=.1):
                   wall_s=duration,
                   mean_power_w=record['run_energy_j'] / duration if record['energy_valid'] else None,
                   power_sample_std_w=statistics.stdev(values) if len(values) > 1 else None,
+                  spbm_mean_power_w={label: rail['mean_w'] for label, rail in
+                                     record.get('spbm', {}).get('rails', {}).items()} or None,
                   stationarity_validation='requires pilot trace review',
                   external_activity_validation='not verified')
     return record
@@ -137,3 +198,26 @@ def adjusted_energy(load, reference, scenario):
     if load.get('token_counts_exact') and not load.get('failed') and tokens > 0:
         result['joules_per_output_token'] = estimate / tokens
     return result
+
+
+def scope_energy_fields(load, references, tokens_ok):
+    """J/token per spbm scope, and gross minus the reference's mean power at that scope.
+
+    `tokens_ok` carries the same rule as the NVML J/token: exact counts, no failures.
+    """
+    out = {}
+    tokens = load.get('output_tokens') or 0
+    duration = load['measurement_end'] - load['measurement_start']
+    for scope, label in spbm_sensor.SCOPES.items():
+        energy = load.get(f'{scope}_energy_j')
+        out[f'joules_per_output_token_{scope}'] = (
+            energy / tokens if energy is not None and tokens_ok and tokens > 0 else None)
+        for name, reference in references.items():
+            watts = ((reference or {}).get('spbm_mean_power_w') or {}).get(label)
+            usable = (energy is not None and watts is not None and duration > 0
+                      and reference['measurement_end'] <= load['measurement_start'])
+            adjusted = energy - watts * duration if usable else None
+            out[f'{name}_adjusted_{scope}_energy_j'] = adjusted
+            out[f'{name}_adjusted_joules_per_output_token_{scope}'] = (
+                adjusted / tokens if adjusted is not None and tokens_ok and tokens > 0 else None)
+    return out

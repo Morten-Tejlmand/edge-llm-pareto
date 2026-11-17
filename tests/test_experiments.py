@@ -47,6 +47,32 @@ class ProtocolTests(unittest.TestCase):
             saved = [json.loads(line) for line in Path(path).read_text().splitlines()]
             self.assertEqual(len({r['trial_id'] for r in saved}), 6)
 
+    def test_warmup_trial_runs_once_unrecorded_and_changes_identity(self):
+        row = dict(output_tok_s=10, failed=0, energy_valid=True, token_counts_exact=True)
+        with tempfile.TemporaryDirectory() as d:
+            path = str(Path(d) / 'r.jsonl')
+            with patch.object(bench, 'run_concurrency_level', AsyncMock(return_value=row)) as run:
+                kwargs = dict(out_path=path, repeats=2, seed=4, requests_per_agent=3)
+                asyncio.run(bench.sweep('', 'm', [1, 2], bench.make_workload(), 'q4', **kwargs))
+                plain_ids = {json.loads(line)['trial_id'] for line in Path(path).read_text().splitlines()}
+                run.reset_mock()
+                asyncio.run(bench.sweep('', 'm', [1, 2], bench.make_workload(), 'q4', warmup_trials=1, **kwargs))
+                # One discarded trial first, unmonitored, past the measured request range.
+                self.assertEqual(run.await_count, 5)
+                first = run.await_args_list[0]
+                self.assertFalse(first.kwargs['monitor_gpu'])
+                c = first.args[2]
+                self.assertEqual(first.kwargs['request_offset'], 2 * c * 3)
+                self.assertEqual(run.await_args_list[1].args[2], c)  # Same concurrency as first measured trial.
+                saved = [json.loads(line) for line in Path(path).read_text().splitlines()]
+                self.assertEqual(len(saved), 8)  # Discarded trial is never written.
+                self.assertFalse({r['trial_id'] for r in saved[4:]} & plain_ids)
+                # Resume with nothing pending skips the warmup trial as well.
+                run.reset_mock()
+                asyncio.run(bench.sweep('', 'm', [1, 2], bench.make_workload(), 'q4', warmup_trials=1,
+                                        resume=True, **kwargs))
+                self.assertEqual(run.await_count, 0)
+
     def test_warmup_excluded_and_chunk_counts_marked(self):
         client = Mock(close=AsyncMock())
         fake = types.SimpleNamespace(AsyncOpenAI=Mock(return_value=client))
@@ -67,6 +93,15 @@ class ProtocolTests(unittest.TestCase):
         self.assertFalse(hardware.check_benchmark_conditions(state, intentional_power_limit=True))
         state.throttle_reasons.append('HW Thermal Slowdown')
         self.assertTrue(hardware.check_benchmark_conditions(state, intentional_power_limit=True))
+
+    def test_idle_gb10_power_cap_flag_is_not_throttling(self):
+        # Observed on the Spark: SW Power Cap reported at 4.95 W, 208/3003 MHz.
+        idle = hardware.PowerState(None, 4.95, None, 208, 3003, ['SW Power Cap'])
+        self.assertEqual(hardware.check_benchmark_conditions(idle), [])
+        idle.throttle_reasons.append('HW Thermal Slowdown')
+        self.assertTrue(hardware.check_benchmark_conditions(idle))
+        unknown_power = hardware.PowerState(None, None, None, 208, 3003, ['SW Power Cap'])
+        self.assertTrue(hardware.check_benchmark_conditions(unknown_power))
 
 
 class AnalysisTests(unittest.TestCase):
@@ -102,6 +137,30 @@ class AnalysisTests(unittest.TestCase):
         a, b = self.row(), self.row('b', '2', 1)
         b['latency_s_p95'] = .5
         self.assertEqual([r['config_id'] for r in analysis.frontier(analysis.aggregate([a,b]), 'latency_s_p95')], ['b'])
+
+    def test_ttft_frontier_minimizes_both(self):
+        a, b = self.row(), self.row('b', '2', 1)
+        b['ttft_s_p95'] = .05
+        self.assertEqual([r['config_id'] for r in analysis.frontier(analysis.aggregate([a, b]), 'ttft_s_p95')], ['b'])
+
+    def test_three_way_frontier_keeps_tradeoffs(self):
+        # a: cheapest energy; b: more throughput at higher energy; c: fastest TTFT;
+        # d: worse than b on every axis.
+        a = self.row('a', '1', 1, 10)
+        b = self.row('b', '2', 2, 20)
+        c = self.row('c', '3', 2, 10)
+        c['ttft_s_p95'] = .01
+        d = self.row('d', '4', 3, 15)
+        d['ttft_s_p95'] = .2
+        data = analysis.aggregate([a, b, c, d])
+        front = sorted(r['config_id'] for r in analysis.frontier(data, 'throughput_ttft'))
+        self.assertEqual(front, ['a', 'b', 'c'])
+        # Without TTFT, c is dominated by a (same throughput, more energy).
+        self.assertEqual(sorted(r['config_id'] for r in analysis.frontier(data)), ['a', 'b'])
+
+    def test_unknown_objective_rejected(self):
+        with self.assertRaises(ValueError):
+            analysis.frontier([], 'nope')
 
 class AdapterTests(unittest.TestCase):
     def test_orin_and_nano_units(self):
