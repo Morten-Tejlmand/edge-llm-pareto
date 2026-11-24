@@ -26,6 +26,20 @@ class BleuTests(unittest.TestCase):
         self.assertEqual(extract_answer('<think>Paris'), ('', 'incomplete_reasoning'))
         self.assertEqual(extract_answer('literal <think> tag'), ('literal <think> tag', 'ok'))
 
+    def test_reasoning_opened_by_the_prompt(self):
+        # Qwen3.8 on vLLM: the chat template ends the prompt with <think>, so the
+        # completion holds only the closing tag (scored 0.00 EM under v1).
+        self.assertEqual(extract_answer('We need the span.\n</think>\n\nDiepoldsau'), ('Diepoldsau', 'ok'))
+        self.assertEqual(extract_answer('reasoning</think>\n<think>more</think>\nParis'), ('Paris', 'ok'))
+        self.assertEqual(extract_answer('Paris'), ('Paris', 'ok'))
+
+    def test_output_limit_before_reasoning_ends_is_incomplete(self):
+        self.assertEqual(extract_answer('still thinking about it', 'length'), ('', 'incomplete_reasoning'))
+        self.assertEqual(extract_answer('<think>still', 'length'), ('', 'incomplete_reasoning'))
+        # Reasoning finished, answer cut off: scored as written.
+        self.assertEqual(extract_answer('done</think>\nPar', 'length'), ('Par', 'ok'))
+        self.assertEqual(extract_answer('still thinking', 'stop'), ('still thinking', 'ok'))
+
     def test_offline_rescore_preserves_raw_and_checks_dataset(self):
         import hashlib
         with tempfile.TemporaryDirectory() as tmp:

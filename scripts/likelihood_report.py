@@ -65,6 +65,8 @@ def build(records, config):
                    tokenizer_matches_frozen_ids=rec['tokenizer_matches_frozen_ids'],
                    tokenizer_encode_ok=rec['tokenizer_check']['encode_ok'],
                    tokenizer_decode_ok=rec['tokenizer_check']['decode_ok'],
+                   text_format=rec.get('text_format'),
+                   answer_ppl_after_first=rec['summary'].get('answer_ppl_after_first'),
                    **{k: rec['summary'][k] for k in ('items', 'answer_tokens', 'answer_nll', 'answer_ppl')})
         for prefix, ref in (('engine_bf16', reference_for(records, config, model, engine)),
                             ('llama_cpp_bf16', reference_for(records, config, model, COMMON_REFERENCE_ENGINE))):

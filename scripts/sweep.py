@@ -54,7 +54,8 @@ def matching_quality(quality, args, rung, revision):
     if quality.get("max_tokens") != quality_limit or quality.get("output_limit_policy") != policy:
         return None
     scorer = quality.get('scorer', '')
-    if quality.get('failed') or not (scorer in ('normalized_exact_match_v1', 'normalized_exact_match_v2|leading_think_blocks_v1') or
+    if quality.get('failed') or not (scorer in ('normalized_exact_match_v1', 'normalized_exact_match_v2|leading_think_blocks_v1',
+                                                   'normalized_exact_match_v2|think_blocks_v2') or
                                     scorer.startswith('sacrebleu_corpus_v1|')):
         raise ValueError('Quality results contain failures or unsupported scoring')
     return quality
@@ -77,8 +78,17 @@ def main() -> int:
     ap.add_argument("--prompt-dataset", help="fixed JSONL prompts with unique id and prompt fields")
     ap.add_argument("--context", type=int, default=4096)
     ap.add_argument("--prompt-tokens", type=int, default=2000)
-    ap.add_argument("--output-tokens", type=int, default=256, help="performance output-token cap; default 256")
+    ap.add_argument("--output-tokens", type=lambda value: None if value.lower() in ('none', 'null', 'uncapped') else int(value),
+                    default=None, help="optional output-token cap; default uncapped within context")
     ap.add_argument("--requests-per-agent", type=int, default=1)
+    ap.add_argument("--full-dataset", action='store_true',
+                    help="answer every dataset question once per trial, in dataset order, at every concurrency")
+    ap.add_argument('--validate-output-tokenizer', action='store_true',
+                    help='validate vLLM input/output tokens against the pinned publisher tokenizer before trials')
+    ap.add_argument("--duration-seconds", type=float, default=0,
+                    help="fixed measurement window with continuous request refill; 0 uses finite request pool")
+    ap.add_argument("--load-warmup-seconds", type=float, default=30,
+                    help="continuous load before each timed measurement window")
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--warmup-requests", type=int, default=0)
     ap.add_argument("--warmup-trials", type=int, default=0,
@@ -93,7 +103,7 @@ def main() -> int:
     ap.add_argument("--runtime-description", help="separate server stack versions or pinned container digest")
     ap.add_argument("--session-note", help="operating conditions and external activity observations")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--workloads", help="YAML list of prompt_tokens/max_output_tokens/temperature mappings; default output cap 256")
+    ap.add_argument("--workloads", help="YAML list of prompt_tokens/max_output_tokens/temperature mappings; default uncapped")
     ap.add_argument("--resume", help="append to this existing result JSONL, skipping successful trial IDs")
     ap.add_argument("--target", choices=["gb10", "jetson"], default="gb10")
     ap.add_argument("--power-setting", default="default", help="label for externally configured power/clock setting")
@@ -109,6 +119,9 @@ def main() -> int:
                     help="frozen per-model token IDs shared by every engine and artifact")
     add_memory_arguments(ap)
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--ready-timeout", type=float,
+                    help="seconds to wait for the server (default: 600 llama.cpp, 1800 vLLM; "
+                         "vLLM loads safetensors and compiles at startup, 480-500 s for Qwen in the pilot)")
     ap.add_argument("--results-dir", default=str(ROOT / "results"))
     ap.add_argument("--allow-throttled", action="store_true",
                     help="run even if the GPU is power-capped (results will not be comparable)")
@@ -129,6 +142,10 @@ def main() -> int:
         ap.error("choose --quality-dataset or --quality-results")
     if args.repeats < 1 or args.warmup_requests < 0 or args.warmup_trials < 0:
         ap.error("repeats must be positive and warmup requests/trials nonnegative")
+    if any(not math.isfinite(x) or x < 0 for x in (args.duration_seconds, args.load_warmup_seconds)):
+        ap.error("duration and load warmup must be finite and nonnegative")
+    if args.full_dataset and (args.duration_seconds or not (args.qa_dataset or args.prompt_dataset)):
+        ap.error("--full-dataset requires a dataset and cannot be combined with timed trials")
     if args.target == "jetson" and not all(any(arg == flag or arg.startswith(flag + "=") for arg in sys.argv) for flag in ("--host-reserve-gib", "--runtime-overhead-gib")):
         ap.error("Jetson requires explicit --host-reserve-gib and --runtime-overhead-gib calibrated for your device")
     cfg = yaml.safe_load(Path(args.config).read_text())
@@ -164,10 +181,12 @@ def main() -> int:
             raise ValueError("likelihood-top-k must be positive")
         if args.quality_max_tokens is not None and args.quality_max_tokens <= 0:
             raise ValueError("quality-max-tokens must be positive")
-        if min(args.context, args.prompt_tokens, args.output_tokens,
+        if args.output_tokens is not None and args.output_tokens <= 0:
+            raise ValueError('output tokens must be positive or none')
+        if min(args.context, args.prompt_tokens,
                args.requests_per_agent) <= 0:
             raise ValueError("context, prompt tokens and requests must be positive")
-        if not (args.prompt_dataset or args.qa_dataset) and args.prompt_tokens + args.output_tokens + 64 > args.context:
+        if not (args.prompt_dataset or args.qa_dataset) and args.prompt_tokens + (args.output_tokens or 1) + 64 > args.context:
             raise ValueError("context must leave generation space after prompt and template tokens")
     except ValueError as exc:
         ap.error(str(exc))
@@ -231,7 +250,7 @@ def main() -> int:
             wl = attach(wl)
             if workloads:
                 workloads = [attach(w) for w in workloads]
-            if args.qa_dataset and args.requests_per_agent % len(wl['prompts']):
+            if args.qa_dataset and not args.duration_seconds and not args.full_dataset and args.requests_per_agent % len(wl['prompts']):
                 print("QA coverage: requests-per-agent is not a multiple of the dataset size; "
                       "inspect unique_questions and dataset_questions in each trial.", flush=True)
         except (ValueError, OSError) as exc:
@@ -254,6 +273,10 @@ def main() -> int:
         runtime_description=args.runtime_description, session_note=args.session_note,
         validation_status='operator declarations; sensor scope and stability require Spark validation')
     measurement_protocol = dict(baseline_seconds=args.baseline_seconds,
+        measurement_mode=('fixed_duration_logprobs_v1' if args.duration_seconds else
+                          'full_dataset_v1' if args.full_dataset else 'finite_pool'),
+        duration_seconds=args.duration_seconds,
+        load_warmup_seconds=args.load_warmup_seconds if args.duration_seconds else 0,
         idle_seconds=args.idle_seconds, telemetry_interval_s=args.sample_interval,
         baseline_frequency='before_each_variant_launch', idle_frequency='after_warmup_before_each_trial',
         warmup_trials=args.warmup_trials, warmup_trial_frequency='after_each_server_start',
@@ -385,18 +408,35 @@ def main() -> int:
 
         with h:
             t0 = time.perf_counter()
-            if not serve.wait_ready(h):
+            ready_timeout = args.ready_timeout or (1800.0 if args.engine == "vllm" else 600.0)
+            if not serve.wait_ready(h, timeout_s=ready_timeout):
                 print(f"   FAILED to become ready. Log tail:\n{serve.tail_log(h, 15)}\n")
                 _record_skip(out_path, r, "server_not_ready", b, log=log_path)
                 continue
             print(f"   ready in {time.perf_counter() - t0:.0f}s")
+            validation_path = None
+            if args.validate_output_tokenizer and args.engine == 'vllm':
+                from edge_llm_pareto.tokenizer_validation import check_running_server
+                try:
+                    validation = asyncio.run(check_running_server(base_url=h.base_url, model=served_model,
+                        tokenizer_repo=args.likelihood_tokenizer[0], tokenizer_revision=args.likelihood_tokenizer[1],
+                        tasks=wl.get('prompts', [])))
+                    validation_path = results_dir / f"{args.model}-{args.engine}-{r['rung']}-{stamp}.tokenizer.json"
+                    validation_path.write_text(json.dumps(validation, ensure_ascii=False, indent=2))
+                    if not validation['valid']:
+                        raise ValueError(f"tokenizer mismatch; see {validation_path}")
+                    print(f"   tokenizer PASS: {validation['input_cases']} input cases and streamed/nonstreamed output")
+                except Exception as exc:
+                    _record_skip(out_path, r, f'output_tokenizer_validation_failed: {exc}', b, log=log_path)
+                    print(f"   SKIP: output tokenizer validation failed: {exc}", flush=True)
+                    continue
             if args.likelihood_dataset:
                 check = run_likelihood(args, h.base_url, served_model, r, resolved_revision,
                                        results_dir, stamp, out_path)
                 # A server tokenizer that disagrees with the reference corrupts
                 # prompts and answers (quality, output lengths, J/token): stop
                 # this variant instead of collecting invalid trials.
-                if check is not None and not (check['encode_ok'] and check['decode_ok']):
+                if check is None or not (check['encode_ok'] and check['decode_ok']):
                     print("   SKIP: server tokenizer does not match the reference tokenizer\n", flush=True)
                     _record_skip(out_path, r, "tokenizer_mismatch", b, log=log_path)
                     continue
@@ -415,12 +455,15 @@ def main() -> int:
                 h.base_url, served_model, levels, wl,
                 label=r["rung"], out_path=str(out_path),
                 requests_per_agent=args.requests_per_agent,
+                duration_seconds=args.duration_seconds, load_warmup_seconds=args.load_warmup_seconds,
+                full_dataset=args.full_dataset,
                 repeats=args.repeats, warmup_requests=args.warmup_requests,
                 seed=args.seed, resume=bool(args.resume), workloads=workloads,
                 idle_seconds=args.idle_seconds, telemetry_interval=args.sample_interval,
                 system_baseline=system_baseline, reference_path=reference_path,
                 warmup_trials=args.warmup_trials,
                 metadata={"device_id": platform.node(), "code_revision": code_revision, "code_fingerprint": code_fingerprint,
+                          "tokenizer_validation_artifact": str(validation_path) if validation_path else None,
                           "environment_id": environment_id, "environment": environment,
                           "session_observations": session_observations,
                           "measurement_protocol": measurement_protocol,
@@ -475,8 +518,8 @@ def run_likelihood(args, base_url, served_model, rung, revision, results_dir, st
         check = old.get('tokenizer_check') or {}
         # Never reuse a record whose tokenizer check failed: rescore with the
         # current server so a fixed tokenizer is actually verified.
-        if (old.get('model_revision'), old.get('dataset_sha256'), old.get('top_k')) == (
-                revision, dataset_sha, args.likelihood_top_k) and check.get('encode_ok') and check.get('decode_ok'):
+        if (old.get('model_revision'), old.get('dataset_sha256'), old.get('top_k'), old.get('text_format')) == (
+                revision, dataset_sha, args.likelihood_top_k, likelihood.TEXT_FORMAT) and check.get('encode_ok') and check.get('decode_ok'):
             print(f"   likelihood: reusing {done}", flush=True)
             return check
     output = results_dir / f"{args.model}-{args.engine}-{rung['rung']}-{stamp}.likelihood.json"

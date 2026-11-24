@@ -190,6 +190,23 @@ for model, rungs in cfg['study']['model_rungs'].items():
         print(f"  ok  {model} {rung} @ {result['revision'][:12]}: {', '.join(result['files'])}", flush=True)
 EOF
 fi
+if [[ ",$ENGINES," == *",vllm,"* ]]; then
+step "Downloading pinned vLLM safetensors (reuses the Hugging Face cache)"
+# vLLM would otherwise download at server start, inside its startup timeout
+# (Qwen3.8-27B BF16 is 52 GB: 7 of its 10 minutes in the pilot).
+"$PY" - <<'EOF'
+import yaml
+from huggingface_hub import snapshot_download
+cfg = yaml.safe_load(open('configs/study.yaml'))
+for model, rungs in cfg['study']['native_vllm_rungs'].items():
+    by_name = {r['rung']: r for r in cfg['models'][model]['engine_rungs']['vllm']['rungs']}
+    for rung in rungs:
+        r = by_name[rung]
+        path = snapshot_download(r['repo'], revision=r['revision'],
+                                 allow_patterns=['*.json', '*.safetensors', '*.jinja', '*.txt', '*.model'])
+        print(f"  ok  {model} {rung} @ {r['revision'][:12]}: {path}", flush=True)
+EOF
+fi
 
 COMMON=(--engines "$ENGINES" --llama-server "$LLAMA_SERVER" --vllm "$VLLM")
 
@@ -223,12 +240,45 @@ for path in glob.glob(f'{sys.argv[1]}/*.jsonl'):
             row = json.loads(line)
         except ValueError:
             continue
-        if row.get('skipped') or row.get('failed'):
+        if row.get('skipped') or row.get('failed') or row.get('token_accounting_error'):
             n += 1
             reason = (f"skipped: {row.get('reason')}" if row.get('skipped')
-                      else f"{row['failed']} failed requests (c={row.get('concurrency')}, trial={row.get('trial')})")
+                      else row.get('token_accounting_error') or f"{row['failed']} failed requests (c={row.get('concurrency')}, trial={row.get('trial')})")
             print(f"  {row.get('engine')} {row.get('label')}: {reason}", file=sys.stderr)
 print(n)
+EOF
+}
+
+validate_answers() {  # count trials whose answers show a decoding or extraction failure
+  # Catches the two pilot bugs that passed the smoke test: raw 'Ġ'/'Ċ' tokenizer
+  # symbols (DeepSeek on vLLM) and reasoning left in the scored answer (Qwen on
+  # vLLM: the chat template opens <think> in the prompt). Exact match 0 is only
+  # a warning: one c=1 trial scores just 3 questions.
+  "$PY" - "$1" <<'EOF'
+import glob, json, sys
+bad = 0
+for path in sorted(glob.glob(f'{sys.argv[1]}/*.jsonl')):
+    for line in open(path):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get('scenario') != 'generation_load' or not row.get('request_results'):
+            continue
+        name = f"{row.get('base_model')} {row.get('engine')} {row.get('label')} c={row.get('concurrency')}"
+        ok = [r for r in row['request_results'] if r.get('ok')]
+        symbols = sum(any(s in (r.get('raw_answer') or '') for s in ('Ġ', 'Ċ')) for r in ok)
+        leaked = sum('think>' in (r.get('answer') or '') for r in ok)
+        if symbols or leaked:
+            bad += 1
+            print(f"  ANSWER CHECK FAILED {name}: {symbols} answers with raw tokenizer symbols, "
+                  f"{leaked} with reasoning tags left in the scored answer", file=sys.stderr)
+            example = next((r for r in ok if 'think>' in (r.get('answer') or '') or 'Ġ' in (r.get('raw_answer') or '')), None)
+            if example:
+                print(f"    e.g. answer: {(example.get('answer') or '')[-120:]!r}", file=sys.stderr)
+        elif ok and row.get('qa_exact_match') == 0:
+            print(f"  warning: {name} scored exact match 0 on {len(ok)} answers; inspect them", file=sys.stderr)
+print(bad)
 EOF
 }
 
@@ -242,7 +292,10 @@ if [ "$MODE" = "vllm-check" ]; then
       || echo "Some $model cells failed; continuing."
   done
   step "vLLM check summary"
-  echo "Skipped/failed rows: $(skipped_rows "$OUT")"
+  CHECK_BAD=$(skipped_rows "$OUT")
+  echo "Skipped/failed rows: $CHECK_BAD"
+  ANSWER_BAD=$(validate_answers "$OUT")
+  echo "Trials failing the answer check: $ANSWER_BAD"
   "$PY" scripts/likelihood_report.py "$OUT/*.likelihood.json" --output "$OUT/report/likelihood.json" \
     || echo "No likelihood results; see the sweep output above."
   "$PY" - "$OUT" <<'EOF'
@@ -262,7 +315,10 @@ for path in sorted(glob.glob(f'{sys.argv[1]}/*.jsonl')):
 print("\nLook for: tokenizer encode/decode OK, no 'Ġ'/'Ċ' symbols in answers, and KL to")
 print("vLLM BF16 above 0 for qwen-fp8 / nvidia-nvfp4. One trial at c=1 is not a quality estimate.")
 EOF
-  step "Done. Results: $OUT   Log: $LOG"
+  if [ "$CHECK_BAD" != "0" ] || [ "$ANSWER_BAD" != "0" ]; then
+    die "vLLM check failed ($CHECK_BAD skipped/failed rows, $ANSWER_BAD trials failing the answer check); see $OUT."
+  fi
+  step "Done: every vLLM row passed. Results: $OUT   Log: $LOG"
   exit 0
 fi
 
@@ -274,9 +330,26 @@ if [ "${SKIP_SMOKE:-0}" != "1" ]; then
     --concurrency 1 --repeats 1 || die "Smoke test failed; see $SMOKE_DIR and $LOG."
   BAD=$(skipped_rows "$SMOKE_DIR")
   [ "$BAD" = "0" ] || die "Smoke test recorded $BAD skipped/failed rows; see $SMOKE_DIR."
+  BAD=$(validate_answers "$SMOKE_DIR")
+  [ "$BAD" = "0" ] || die "Smoke test: $BAD trials failed the answer check; see $SMOKE_DIR."
   echo "Smoke test passed."
 fi
 [ "$MODE" = "smoke" ] && { step "Done (smoke only)."; exit 0; }
+
+# ---------------------------------------------------------------- preflight
+# Before the multi-day study: every configuration once at c=1 (both engines,
+# both models), with the tokenizer and answer checks. The smoke test covers only
+# DeepSeek, which let the Qwen-on-vLLM scoring bug through the pilot.
+if [ "$MODE" = "full" ] && [ "${SKIP_PREFLIGHT:-0}" != "1" ]; then
+  step "Preflight: every configuration once at concurrency 1 (~1.5-2 h; SKIP_PREFLIGHT=1 skips)"
+  PRE_DIR="results/preflight-$STAMP"
+  run_study "$PRE_DIR" --concurrency 1 --repeats 1 || echo "Some preflight cells failed."
+  BAD=$(skipped_rows "$PRE_DIR")
+  [ "$BAD" = "0" ] || die "Preflight recorded $BAD skipped/failed rows; see $PRE_DIR. Fix them before the full study."
+  BAD=$(validate_answers "$PRE_DIR")
+  [ "$BAD" = "0" ] || die "Preflight: $BAD trials failed the answer check; see $PRE_DIR."
+  echo "Preflight passed: every configuration starts, tokenizes and scores correctly."
+fi
 
 # ---------------------------------------------------------------- main run
 # Fixed folder per mode: re-running the script continues an interrupted run

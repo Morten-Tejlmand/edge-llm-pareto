@@ -3,6 +3,7 @@
 import argparse
 import copy
 import json
+import math
 from pathlib import Path
 import shlex
 import subprocess
@@ -15,7 +16,8 @@ sys.path.insert(0, str(ROOT / 'src'))
 
 
 def build_commands(config, *, config_path, qa_dataset, repeats=None, requests=None,
-                   llama_server='llama-server', vllm='vllm', results_dir='results'):
+                   llama_server='llama-server', vllm='vllm', results_dir='results',
+                   duration_seconds=None, load_warmup_seconds=None):
     """Return (commands, configurations, trials) for the GGUF matrix plus native vLLM rows.
 
     `model_rungs` lists GGUF artifacts, run on every engine in `gguf_engines`
@@ -25,6 +27,11 @@ def build_commands(config, *, config_path, qa_dataset, repeats=None, requests=No
     study = config['study']
     repetitions = study['repeats'] if repeats is None else repeats
     request_count = study['requests_per_agent'] if requests is None else requests
+    duration = (study.get('duration_seconds', 0) if requests is None else 0) if duration_seconds is None else duration_seconds
+    load_warmup = study.get('load_warmup_seconds', 30) if load_warmup_seconds is None else load_warmup_seconds
+    full_dataset = study.get('full_dataset', False) and requests is None and not duration
+    if any(not math.isfinite(x) or x < 0 for x in (duration, load_warmup)):
+        raise ValueError('duration and load warmup must be finite and nonnegative')
     if repetitions < 1 or request_count < 1:
         raise ValueError('Repetitions and requests must be positive')
     gguf_engines = study.get('gguf_engines', study['engines'])
@@ -58,13 +65,19 @@ def build_commands(config, *, config_path, qa_dataset, repeats=None, requests=No
             '--repeats', str(repetitions), '--requests-per-agent', str(request_count),
             '--warmup-requests', str(study['warmup_requests']),
             '--warmup-trials', str(study.get('warmup_trials', 0)),
-            '--output-tokens', str(study['output_tokens']),
+            '--output-tokens', 'none' if study['output_tokens'] is None else str(study['output_tokens']),
             '--context', str(study['context']), '--server-parallel', str(study['server_parallel']),
             '--seed', str(study['seed']), '--gsmm', '--results-dir', str(results_dir),
             '--llama-server', llama_server, '--vllm', vllm])
         if study.get('likelihood'):
             commands[-1] += ['--likelihood-dataset', str(qa_dataset),
                              '--likelihood-top-k', str(study.get('likelihood_top_k', 20))]
+        if duration:
+            commands[-1] += ['--duration-seconds', str(duration), '--load-warmup-seconds', str(load_warmup)]
+        if full_dataset:
+            commands[-1] += ['--full-dataset']
+        if engine == 'vllm':
+            commands[-1] += ['--validate-output-tokenizer']
     return commands, configurations, configurations * repetitions
 
 
@@ -141,6 +154,8 @@ def main():
     parser.add_argument('--qa-dataset', help='override the configured QA dataset')
     parser.add_argument('--repeats', type=int, help='override repetitions for a pilot')
     parser.add_argument('--requests-per-agent', type=int, help='override request count for a pilot')
+    parser.add_argument('--duration-seconds', type=float, help='override timed trial duration; 0 selects finite pool')
+    parser.add_argument('--load-warmup-seconds', type=float, help='override timed trial load warmup')
     parser.add_argument('--llama-server', default='llama-server')
     parser.add_argument('--vllm', default='vllm')
     parser.add_argument('--results-dir', default=str(ROOT / 'results'))
@@ -171,6 +186,7 @@ def main():
         attach_qa(make_workload(), dataset)
         commands, configurations, trials = build_commands(config, config_path=config_path,
             qa_dataset=dataset, repeats=args.repeats, requests=args.requests_per_agent,
+            duration_seconds=args.duration_seconds, load_warmup_seconds=args.load_warmup_seconds,
             llama_server=args.llama_server, vllm=args.vllm, results_dir=args.results_dir)
     except (ValueError, KeyError, OSError) as exc:
         parser.error(str(exc))

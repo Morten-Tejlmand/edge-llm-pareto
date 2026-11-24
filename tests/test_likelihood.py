@@ -109,7 +109,9 @@ class LikelihoodTest(unittest.TestCase):
         llama = self.run_engine('llama_cpp', 'gguf-bf16')
         vllm = self.run_engine('vllm', 'native-bf16')
         self.assertEqual(llama['sequences_sha256'], vllm['sequences_sha256'])
-        self.assertEqual(llama['summary']['answer_tokens'], len(' abc') + len(' de'))
+        self.assertEqual(llama['summary']['answer_tokens'], len('abc') + len('de'))
+        self.assertIn('answer_ppl_after_first', llama['summary'])
+        self.assertEqual(llama['text_format'], 'prompt_answer_newline_v3')
         self.assertTrue(llama['tokenizer_check']['encode_ok'] and vllm['tokenizer_check']['decode_ok'])
         self.assertAlmostEqual(llama['summary']['answer_ppl'], vllm['summary']['answer_ppl'])
         c = lk.compare(llama, vllm)
@@ -145,8 +147,28 @@ class LikelihoodTest(unittest.TestCase):
             lk.load_or_build_tokens(cache, None, None, base_model='qwen3.8-27b', dataset_sha256='x')
 
     def test_item_text_does_not_repeat_answer_prefix(self):
-        self.assertEqual(lk.item_texts(TASKS[0])[1], 'Passage: x. Question: y? Answer: abc')
-        self.assertEqual(lk.item_texts(TASKS[1])[1], 'Passage: z. Question: w?\n\nAnswer: de')
+        # v3: the answer starts after a blank line that belongs to the scored context.
+        self.assertEqual(lk.item_texts(TASKS[0]), ('Passage: x. Question: y? Answer:\n\n',
+                                                   'Passage: x. Question: y? Answer:\n\nabc'))
+        self.assertEqual(lk.item_texts(TASKS[1])[1], 'Passage: z. Question: w?\n\nAnswer:\n\nde')
+
+    def test_frozen_tokens_reject_other_text_format(self):
+        self.run_engine('llama_cpp', 'gguf-bf16')
+        cache = next((self.dir / 'tokens').glob('*.json'))
+        self.assertIn(lk.TEXT_FORMAT, cache.name)
+        frozen = json.loads(cache.read_text())
+        frozen['text_format'] = 'prompt_answer_colon_v2'
+        cache.write_text(json.dumps(frozen))
+        with self.assertRaises(ValueError):
+            lk.load_or_build_tokens(cache, None, None, base_model=frozen['base_model'],
+                                    dataset_sha256=frozen['dataset_sha256'])
+
+    def test_summary_separates_first_answer_token(self):
+        items = [dict(positions=[dict(target_logprob=-4.0), dict(target_logprob=0.0)]),
+                 dict(positions=[dict(target_logprob=-2.0)])]
+        s = lk.summarize(items)
+        self.assertAlmostEqual(s['first_token_nll'], 3.0)
+        self.assertAlmostEqual(s['answer_ppl_after_first'], 1.0)
 
     def test_tokenizer_check_flags_broken_server_tokenizers(self):
         # The pilot's vLLM bug: byte-level symbols leak into decoded text.

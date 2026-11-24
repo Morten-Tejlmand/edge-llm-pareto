@@ -1,7 +1,12 @@
 """Teacher-forced answer likelihood on the QA set: perplexity and KL divergence.
 
-Each QA item is scored as the fixed text ``{prompt} {reference answer}`` (the QA
-prompts end in ``Answer:``; it is appended when missing).
+Each QA item is scored as the fixed text ``{prompt}\n\n{reference answer}`` (the QA
+prompts end in ``Answer:``; it is appended when missing). The blank line is part
+of the scored context, not of the answer: after ``Answer:`` Qwen3.8 predicts
+``\n\n`` for every item, so with v2's same-line `` {answer}`` its first answer
+token carried ~95% of the answer loss and answer PPL measured the separator, not
+the answer (see docs/pilot-findings-vllm.md). ``answer_ppl_after_first`` (all
+answer tokens but the first) is recorded as a separator-insensitive companion.
 The text is tokenized once per model with the publisher's reference tokenizer
 (``tokenizer.json`` of the model's ``shape_from`` repo at ``shape_revision``), and
 the same token IDs are sent to every engine and artifact, so all of them score
@@ -37,7 +42,7 @@ import statistics
 from pathlib import Path
 
 SCHEMA_VERSION = 2
-TEXT_FORMAT = 'prompt_answer_colon_v2'
+TEXT_FORMAT = 'prompt_answer_newline_v3'
 KL_METHOD = 'topk_reference_plus_tail_bucket_v1'
 DEFAULT_TOP_K = 20  # vLLM's default --max-logprobs
 LLAMA_FALLBACK_PROBS = (1000, 200000)
@@ -45,11 +50,12 @@ TOKENIZER_CHECK_SAMPLES = 10
 
 
 def item_texts(task):
-    """Prompt ending in 'Answer:' (added if missing), then ' ' + first reference answer."""
+    """Prompt ending in 'Answer:' (added if missing) plus a blank line, then the first reference answer."""
     context = task['prompt'].rstrip()
     if not context.endswith('Answer:'):
         context += '\n\nAnswer:'
-    return context, context + ' ' + task['answers'][0].strip()
+    context += '\n\n'
+    return context, context + task['answers'][0].strip()
 
 
 def load_tasks(path):
@@ -102,6 +108,9 @@ class ReferenceTokenizer:
 
     def identity(self):
         return dict(repo=self.repo, revision=self.revision)
+
+    def decode(self, ids):
+        return self.tokenizer.decode(ids, skip_special_tokens=True)
 
 
 def build_sequences(encode, tasks):
@@ -235,7 +244,7 @@ def load_or_build_tokens(cache_path, reference, tasks, *, base_model, dataset_sh
     if cache.exists():
         frozen = json.loads(cache.read_text())
         if (frozen.get('schema_version') != SCHEMA_VERSION or frozen['base_model'] != base_model
-                or frozen['dataset_sha256'] != dataset_sha256):
+                or frozen['dataset_sha256'] != dataset_sha256 or frozen.get('text_format') != TEXT_FORMAT):
             raise ValueError(f'{cache} belongs to another model, dataset or format; delete it to rebuild')
         if reference is not None and frozen['tokenizer'] != reference.identity():
             raise ValueError(f'{cache} was built with another tokenizer revision; delete it to rebuild')
@@ -260,7 +269,7 @@ async def evaluate(*, base_url, engine, model, base_model, label, model_repo, mo
     tasks, dataset_sha = load_tasks(dataset)
     if reference is None and tokenizer_repo:
         reference = ReferenceTokenizer(tokenizer_repo, tokenizer_revision)
-    cache = Path(tokens_dir) / f'{base_model}-{dataset_sha[:12]}.json'
+    cache = Path(tokens_dir) / f'{base_model}-{dataset_sha[:12]}-{TEXT_FORMAT}.json'
     frozen = load_or_build_tokens(cache, reference, tasks, base_model=base_model,
                                   dataset_sha256=dataset_sha)
     async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
@@ -286,8 +295,12 @@ def summarize(items):
     if not nll:
         raise ValueError('No scored answer tokens')
     mean = statistics.fmean(nll)
+    first = [-i['positions'][0]['target_logprob'] for i in items if i['positions']]
+    later = [-p['target_logprob'] for i in items for p in i['positions'][1:]]
     return dict(items=len(items), answer_tokens=len(nll), answer_nll=mean,
-                answer_ppl=math.exp(mean))
+                answer_ppl=math.exp(mean),
+                first_token_nll=statistics.fmean(first),
+                answer_ppl_after_first=math.exp(statistics.fmean(later)) if later else None)
 
 
 def _logsumexp(values):

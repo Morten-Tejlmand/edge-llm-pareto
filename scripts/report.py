@@ -91,7 +91,6 @@ def main() -> int:
         try:
             if args.perplexity_results:
                 from edge_llm_pareto.perplexity import attach_results
-                from pathlib import Path
                 rows = attach_results(rows, [json.loads(Path(p).read_text()) for p in args.perplexity_results])
             if args.likelihood_results:
                 from edge_llm_pareto.analysis import attach_likelihood

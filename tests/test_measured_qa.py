@@ -149,11 +149,49 @@ class MeasuredQATests(unittest.TestCase):
         self.assertEqual(rc, 0)
         wl = run.call_args.args[3]
         self.assertEqual(wl['evaluation_mode'], 'measured_qa')
-        self.assertEqual(wl['max_output_tokens'], 256)
+        self.assertIsNone(wl['max_output_tokens'])
         self.assertEqual(wl['prompts'][0]['answers'], ['Paris'])
 
 
 class TrialCoverageTest(unittest.TestCase):
+    def test_full_dataset_repeats_identical_questions_at_every_concurrency(self):
+        tasks = [dict(id=str(i), prompt=f'Question {i}?', answers=['answer']) for i in range(19)]
+        wl = dict(bench.make_workload(), prompts=tasks)
+        submitted = []
+        active = peak = 0
+
+        async def request(client, model, workload, seed):
+            nonlocal active, peak
+            submitted.append((seed, bench.make_prompt(workload, seed)))
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(.002 if seed % 2 else .001)
+            active -= 1
+            return bench.request_result(True, seed, token_count_source='server', output_tokens=1, latency_s=.001)
+
+        with patch('openai.AsyncOpenAI', return_value=Mock(close=AsyncMock())), \
+             patch.object(bench, '_one_request', side_effect=request):
+            for concurrency in (1, 4, 16):
+                for _ in range(2):
+                    submitted.clear()
+                    peak = 0
+                    row = asyncio.run(bench.run_concurrency_level('', 'm', concurrency, wl,
+                        full_dataset=True, request_offset=999, monitor_gpu=False))
+                    self.assertEqual(submitted, [(i, t['prompt']) for i, t in enumerate(tasks)])
+                    self.assertEqual(row['requests'], 19)
+                    self.assertEqual(row['output_tokens'], 19)
+                    self.assertEqual(peak, concurrency)
+                    self.assertEqual(active, 0)
+                    self.assertEqual(row['measurement_mode'], 'full_dataset_v1')
+
+    def test_full_dataset_sweeps_start_each_trial_at_zero(self):
+        row = dict(output_tok_s=10, failed=0)
+        with patch.object(bench, 'run_concurrency_level', AsyncMock(return_value=row)) as run:
+            asyncio.run(bench.sweep('', 'm', [1, 4, 16], bench.make_workload(), 'q4',
+                repeats=3, full_dataset=True))
+        self.assertEqual(run.await_count, 9)
+        self.assertTrue(all(c.kwargs['full_dataset'] and c.kwargs['request_offset'] == 0 for c in run.await_args_list))
+
     def test_trials_continue_through_the_dataset(self):
         row = dict(output_tok_s=10, failed=0, energy_valid=True, token_counts_exact=True)
         with patch.object(bench, 'run_concurrency_level', AsyncMock(return_value=row)) as run:

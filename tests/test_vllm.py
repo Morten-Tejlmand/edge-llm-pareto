@@ -13,6 +13,27 @@ from edge_llm_pareto.perplexity import attach_results
 
 
 class VllmTests(unittest.TestCase):
+    def test_failed_or_unavailable_output_tokenizer_check_blocks_trials(self):
+        for result in (dict(valid=False, input_cases=0), RuntimeError('server unsupported')):
+            options = dict(side_effect=result) if isinstance(result, Exception) else dict(return_value=result)
+            with self.subTest(result=result), tempfile.TemporaryDirectory() as d, \
+                 patch('edge_llm_pareto.tokenizer_validation.check_running_server', AsyncMock(**options)):
+                (rc, row, _, run, _, _), _ = self.run_backend(d, extra=['--validate-output-tokenizer'])
+                self.assertEqual(rc, 1)
+                self.assertTrue(row['skipped'])
+                self.assertIn('output_tokenizer_validation_failed', row['reason'])
+                run.assert_not_awaited()
+
+    def test_successful_output_tokenizer_check_is_saved_before_trials(self):
+        with tempfile.TemporaryDirectory() as d, \
+             patch('edge_llm_pareto.tokenizer_validation.check_running_server', AsyncMock(
+                 return_value=dict(valid=True, input_cases=202, mismatches=[]))):
+            (rc, row, _, run, _, _), _ = self.run_backend(d, extra=['--validate-output-tokenizer'])
+            self.assertEqual(rc, 0)
+            self.assertEqual(run.await_count, 2)
+            artifact = Path(row['tokenizer_validation_artifact'])
+            self.assertTrue(json.loads(artifact.read_text())['valid'])
+
     def test_user_speed_uses_each_request_latency_and_exact_counts(self):
         requests = [bench.request_result(True, token_count_source=source,
                     output_tokens=tokens, latency_s=latency, ttft_s=.1)

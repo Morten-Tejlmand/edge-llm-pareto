@@ -29,6 +29,22 @@ def rows(commands):
 
 
 class StudyMatrixTest(unittest.TestCase):
+    def test_full_dataset_study_defaults_and_pilot_override(self):
+        commands, _, _ = build(CONFIG)
+        for command in commands:
+            self.assertNotIn('--duration-seconds', command)
+            self.assertIn('--full-dataset', command)
+            self.assertEqual(command[command.index('--output-tokens') + 1], 'none')
+            if command[command.index('--engine') + 1] == 'vllm':
+                self.assertIn('--validate-output-tokenizer', command)
+        commands, _, _ = qa_study.build_commands(CONFIG, config_path=CONFIG_PATH,
+            qa_dataset='qa.jsonl', requests=1)
+        self.assertTrue(all('--duration-seconds' not in c for c in commands))
+        self.assertTrue(all('--full-dataset' not in c for c in commands))
+        commands, _, _ = qa_study.build_commands(CONFIG, config_path=CONFIG_PATH,
+            qa_dataset='qa.jsonl', requests=1, duration_seconds=120)
+        self.assertTrue(all(c[c.index('--duration-seconds') + 1] == '120' for c in commands))
+
     def test_main_study_is_1500_trials(self):
         commands, configurations, trials = build(CONFIG)
         # llama.cpp: 2 models x 3 GGUF rungs; vLLM: 3 Qwen + 1 DeepSeek native rungs;

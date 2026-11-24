@@ -31,7 +31,7 @@ class UncappedTests(unittest.TestCase):
         async def stream():
             yield SimpleNamespace(usage=None, choices=[SimpleNamespace(
                 delta=SimpleNamespace(content='answer'), finish_reason='stop')])
-        for workload, expected in ((bench.make_workload(), 256),
+        for workload, expected in ((bench.make_workload(max_output_tokens=256), 256),
                                    (bench.make_workload(max_output_tokens=512), 512)):
             with self.subTest(expected=expected):
                 client = Mock()
@@ -42,6 +42,10 @@ class UncappedTests(unittest.TestCase):
         for invalid in (0, -1, True, 1.5):
             with self.assertRaises(ValueError):
                 bench.make_workload(max_output_tokens=invalid)
+
+    def test_default_performance_workload_is_uncapped(self):
+        self.assertIsNone(bench.make_workload()['max_output_tokens'])
+        self.assertEqual(bench.make_workload()['output_limit_policy'], 'eos_or_context')
 
     def test_qa_has_no_hidden_cap_and_records_uncapped_protocol(self):
         client = Mock()

@@ -26,17 +26,32 @@ def corpus_bleu(predictions, references):
                 system_length=score.sys_len, reference_length=score.ref_len)
 
 
-ANSWER_EXTRACTION = 'leading_think_blocks_v1'
+ANSWER_EXTRACTION = 'think_blocks_v2'
 
 
-def extract_answer(raw):
-    """Remove only leading, explicitly delimited reasoning blocks."""
+def extract_answer(raw, finish_reason=None):
+    """Remove leading reasoning blocks and return (answer, status).
+
+    v2 handles two cases v1 (``leading_think_blocks_v1``) scored as wrong answers:
+    - Prompt-opened reasoning: some chat templates (Qwen3.8 on vLLM) end the
+      generation prompt with ``<think>``, so the completion holds only the
+      closing tag. Text before a first ``</think>`` that has no opening tag is
+      treated as reasoning.
+    - Cut-off reasoning: a completion stopped by the output limit
+      (``finish_reason == 'length'``) before any ``</think>`` is incomplete
+      reasoning, whether or not the opening tag was generated.
+    """
     answer = raw.strip()
+    head, closed, _ = answer.partition('</think>')
+    if closed and '<think>' not in head:
+        answer = '<think>' + answer
     while answer.startswith('<think>'):
         end = answer.find('</think>', len('<think>'))
         if end < 0:
             return '', 'incomplete_reasoning'
         answer = answer[end + len('</think>'):].strip()
+    if finish_reason == 'length' and not closed:
+        return '', 'incomplete_reasoning'
     return answer, 'ok'
 
 
@@ -49,7 +64,7 @@ def score_results(record, tasks, scorer):
     for task in tasks:
         result = by_id[task['id']]
         raw = result.get('raw_answer', result.get('answer', ''))
-        answer, status = extract_answer(raw)
+        answer, status = extract_answer(raw, result.get('finish_reason'))
         result.update(raw_answer=raw, answer=answer, extraction_status=status,
                       correct=not result.get('error') and normalize(answer) in
                       [normalize(a) for a in task['answers']])

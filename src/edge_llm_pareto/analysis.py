@@ -18,6 +18,8 @@ def comparison_key(row, combine_models=False):
         engine=row.get('engine'), backend=row.get('backend_version'),
         environment=row.get('environment_id'), server_parallel=row.get('server_parallel'),
         measurement_protocol=row.get('measurement_protocol'),
+        workload_protocol=(protocol.get('measurement_protocol')
+                           if row.get('duration_seconds') or row.get('measurement_mode') == 'full_dataset_v1' else None),
         code=row.get('code_fingerprint'), memory_budget=row.get('memory_budget'),
         requests_per_agent=protocol.get('requests_per_agent'), warmup=protocol.get('warmup_requests')))
 
@@ -104,7 +106,7 @@ def aggregate(rows, combine_models=False):
     output = []
     for (group, config), trials in groups.items():
         first = trials[0]
-        r = {k: first.get(k) for k in ('label', 'concurrency', 'engine', 'base_model', 'power_setting', 'quality', 'perplexity_evaluation', 'likelihood', 'server_parallel')}
+        r = {k: first.get(k) for k in ('label', 'concurrency', 'engine', 'base_model', 'power_setting', 'quality', 'perplexity_evaluation', 'likelihood', 'server_parallel', 'measurement_mode', 'duration_seconds', 'load_warmup_seconds')}
         r.update(comparison_group=group, config_id=config, trials=len(trials))
         if any((t.get('quality') or {}).get('evaluation_mode') == 'measured_qa' for t in trials):
             r['quality'] = measured_quality_summary(trials)
@@ -115,6 +117,7 @@ def aggregate(rows, combine_models=False):
             r[metric + '_std'] = sd
             r[metric + '_cv_pct'] = 100 * sd / abs(r[metric]) if sd is not None and r[metric] else None
         for metric in ('user_output_tok_s_mean', 'user_output_tok_s_p50', 'user_output_tok_s_p05',
+                       'effective_concurrency', 'concurrency_occupancy', 'drain_s',
                        'system_baseline_adjusted_energy_j', 'system_baseline_adjusted_joules_per_output_token',
                        'server_idle_adjusted_energy_j', 'server_idle_adjusted_joules_per_output_token',
                        'qa_score', 'qa_exact_match', 'qa_bleu', 'qa_incomplete_reasoning',
